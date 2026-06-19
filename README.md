@@ -1,21 +1,145 @@
-Overview: The AI Portfolio Manager is a Python-based financial assistant that analyzes stock portfolios using live market data and a local Large Language Model (Qwen via Ollama). It helps users understand their investments in simple language by combining real-time data with AI-generated insights.
-Features: Fetch real-time stock prices using Yahoo Finance, Calculate total portfolio value dynamically, Basic risk analysis based on diversification, AI-powered portfolio insights using Qwen (local LLM),Interactive command-line assistant
-Tech Stack: Python, Pandas, yFinance, Ollama (Qwen 3 8B), VS Code
-How It Works: CSV Portfolio → Python Loader → Live Stock Prices → Portfolio Calculator → AI (Qwen) → Insights
-Example Usage: What is my portfolio value?
-AI Output: Your portfolio is valued at ₹63,910. It is moderately diversified with exposure to IT stocks like TCS and Infosys...
-Project Structure: AI_PORTFOLIO_MANAGER/
+# 📊 Pro Trading Intelligence Dashboard
+
+A professional-grade **portfolio analytics and investment intelligence platform** built using Python, Streamlit, and AI.
+
+This system goes beyond basic portfolio tracking by integrating:
+- Real-time market data
+- Institutional-level risk analytics
+- Portfolio performance benchmarking
+- AI-powered investment insights using local LLMs
+
+---
+
+## 🚀 Key Features
+
+### 📈 Portfolio Analytics
+- Real-time portfolio valuation using live market data (Yahoo Finance)
+- Unrealized Profit & Loss (PnL) tracking
+- Portfolio weight distribution
+- Sector-level breakdown
+
+### 📊 Performance & Benchmarking
+- Portfolio performance curve (cumulative returns)
+- Benchmark comparison (NIFTY 50 index)
+- Normalized return analysis
+
+### ⚠️ Risk Management Engine
+- Sharpe Ratio (risk-adjusted returns)
+- CAPM Beta (market sensitivity)
+- Rolling Beta trends
+- Concentration risk detection
+- Volatility estimation
+
+### 🧠 AI-Powered Insights
+- Portfolio analysis using local LLM (Ollama)
+- Natural language investment explanations
+- Institutional-style commentary generation
+
+### 🎛️ Interactive Dashboard
+- Sector filtering
+- Stock-level filtering
+- Exposure-based filters (PnL, weight)
+- Dynamic portfolio slicing
+
+---
+
+## 🧠 Tech Stack
+
+- Python 3
+- Streamlit
+- Pandas & NumPy
+- Plotly (interactive charts)
+- Yahoo Finance API (`yfinance`)
+- Scikit-learn (CAPM regression)
+- Ollama (Local LLM - Qwen)
+
+---
+
+## 🏗️ Architecture
+
+```
+CSV Portfolio → Data Loader → Live Market Prices → 
+Portfolio Engine → Risk Analytics Layer → 
+Visualization Dashboard → AI Insights Layer
+```
+
+---
+
+## 📂 Project Structure
+
+```
+AI_Portfolio_Manager/
 │
-├── main.py
-├── llm.py
-├── portfolio.py
-├── README.md
+├── app.py                  # Main Streamlit dashboard
+├── llm.py                  # AI insights engine (Ollama)
+├── portfolio.py            # Portfolio utilities
+├── main.py                 # (optional runner script)
 │
 ├── data/
-│   └── portfolio.csv
+│   └── portfolio.csv       # User holdings
 │
-└── venv/
+├── auth/
+│   └── users.yaml          # Authentication config
+│
+├── requirements.txt
+├── README.md
+└── .gitignore
+```
 
-Project Summary: This project is a simple AI-powered portfolio manager that combines real-time stock data with a local AI model to generate investment insights.
-It demonstrates how Python, financial data APIs, and local LLMs can work together to build an intelligent assistant that explains portfolio performance in simple terms.
-This is an early version of the project, with scope for future improvements like dashboards, better risk models, and advanced AI agent capabilities.
+---
+
+## 📊 Example Metrics Produced
+
+- Portfolio Value (₹)
+- Annualized Returns
+- Sharpe Ratio (Risk-adjusted return)
+- Beta vs NIFTY
+- Sector exposure
+- Stock-level contribution to returns
+
+---
+
+## 🧪 AI Insight Example
+
+> "The portfolio shows moderate exposure to high-beta IT stocks, leading to elevated volatility compared to the NIFTY benchmark. Risk-adjusted returns are stable, but concentration risk is present in top holdings. Consider diversification into defensive sectors."
+
+---
+
+## 📦 Installation & Run
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+---
+
+## 🔮 Future Improvements (Roadmap)
+
+- Portfolio optimization engine (Markowitz model)
+- Monte Carlo simulation for risk forecasting
+- Real-time trading simulation engine
+- Multi-user SaaS architecture
+- Live broker integration (paper trading)
+- Advanced factor models (Fama-French)
+
+---
+
+## 📌 Project Summary
+
+This project demonstrates a **real-world fintech-style analytics system** combining:
+
+- Financial data engineering
+- Portfolio risk modeling
+- Machine learning regression (CAPM beta)
+- AI-driven investment commentary
+- Interactive dashboard development
+
+It is designed as a **Bloomberg-style prototype dashboard** for portfolio intelligence and decision support.
+
+---
+
+## 👤 Author
+
+Built by Hardik Sharma  
+GitHub: https://github.com/hardiksharma0993
