@@ -1,57 +1,56 @@
 from portfolio import (
     get_total_value,
-    get_risk_score,
-    get_portfolio_summary
+    get_metrics,
+    get_portfolio_history
 )
 
 from llm import ask_llm
 
-print("\n📊 AI Portfolio Agent (Tool Version)")
+
+print("\n📊 Portfolio AI Assistant")
 print("Type exit to quit\n")
+
 
 while True:
 
-    user_query = input("You: ")
+    q = input("You: ")
 
-    if user_query.lower() == "exit":
+    if q.lower() == "exit":
         break
 
-    # 🧠 TOOL SELECTION LOGIC
-    if "value" in user_query:
-        result = get_total_value()
+    try:
 
-        prompt = f"""
-User asked: {user_query}
-Portfolio value is ₹{result}
-Explain this simply.
+        if "value" in q.lower():
+
+            v = get_total_value()
+
+            prompt = f"Portfolio Value: ₹{v:,.0f}. Explain simply."
+
+        elif "risk" in q.lower():
+
+            m = get_metrics()
+
+            prompt = f"""
+Annual Return: {m['annual_return']:.2%}
+Sharpe: {m['sharpe']:.2f}
+Beta: {m['beta']:.2f}
+Max Drawdown: {m['max_drawdown']:.2%}
+
+Explain risk.
 """
 
-    elif "risk" in user_query:
-        result = get_risk_score()
+        elif "portfolio" in q.lower():
 
-        prompt = f"""
-User asked: {user_query}
-Risk analysis: {result}
-Explain this in simple terms.
-"""
+            p = get_portfolio_history()
 
-    elif "portfolio" in user_query:
-        result = get_portfolio_summary()
+            prompt = f"Portfolio series:\n{p.tail(10)}"
 
-        prompt = f"""
-User asked: {user_query}
-Holdings: {result}
-Explain this simply.
-"""
+        else:
+            prompt = q
 
-    else:
-        prompt = f"""
-You are a financial assistant.
+        print("\nAI:\n")
+        print(ask_llm(prompt))
+        print("\n")
 
-Answer this:
-{user_query}
-"""
-
-    response = ask_llm(prompt)
-
-    print("\nAI:", response)
+    except Exception as e:
+        print("ERROR:", e)
