@@ -47,7 +47,7 @@ except Exception as e:
     st.warning(f"⚠️ Price fetch failed: {e}")
     prices = {}
 
-df["CurrentPrice"] = df["Ticker"].astype(str).map(prices).fillna(0)
+df["CurrentPrice"] = df["Ticker"].apply(lambda x: prices.get(x, 0))
 df["Value"] = df["CurrentPrice"] * df["Shares"]
 df["Sector"] = df["Ticker"].map(sector_map).fillna("Other")
 df["Weight"] = df["Value"] / df["Value"].sum()

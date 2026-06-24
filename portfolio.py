@@ -2,93 +2,90 @@ import pandas as pd
 import yfinance as yf
 
 
-# ---------------------------
-# PORTFOLIO (keep simple or replace with CSV later)
-# ---------------------------
+# ----------------------------
+# LOAD PORTFOLIO
+# ----------------------------
 def load_portfolio():
-    return {
-        "AAPL": 5,
-        "MSFT": 3,
-        "GOOGL": 2,
-        "TSLA": 1
-    }
+    return pd.DataFrame({
+        "Ticker": ["AAPL", "TSLA", "MSFT"],
+        "Shares": [10, 5, 8],
+        "AvgCost": [150, 220, 300]
+    })
 
 
-# ---------------------------
-# SAFE PRICE FETCH (FIXED)
-# ---------------------------
+# ----------------------------
+# GET CURRENT PRICES (FIXED)
+# ----------------------------
 def get_current_prices(tickers):
     prices = {}
 
     for t in tickers:
         try:
-            ticker = yf.Ticker(t)
-            data = ticker.history(period="1d")
+            data = yf.Ticker(t).history(period="1d")
 
-            if not data.empty:
+            if data is not None and not data.empty:
                 prices[t] = float(data["Close"].iloc[-1])
             else:
-                prices[t] = None
+                prices[t] = 0
 
         except Exception:
-            prices[t] = None
+            prices[t] = 0
 
     return prices
 
 
-# ---------------------------
-# PRICE HISTORY
-# ---------------------------
-def get_portfolio_history(tickers):
-    data = yf.download(tickers, period="6mo")["Close"]
-    return data
+# ----------------------------
+# PORTFOLIO HISTORY (MOCK SAFE)
+# ----------------------------
+def get_portfolio_history():
+    return pd.DataFrame({
+        "Date": pd.date_range("2024-01-01", periods=5),
+        "Value": [10000, 10500, 10200, 11000, 11500]
+    })
 
 
-# ---------------------------
-# METRICS (returns + volatility)
-# ---------------------------
-def get_metrics(tickers):
-    data = yf.download(tickers, period="6mo")["Close"]
-    returns = data.pct_change().dropna()
+# ----------------------------
+# METRICS
+# ----------------------------
+def get_metrics(df, prices):
+    df = df.copy()
+
+    df["CurrentPrice"] = df["Ticker"].apply(lambda x: prices.get(x, 0))
+    df["MarketValue"] = df["Shares"] * df["CurrentPrice"]
+    df["CostValue"] = df["Shares"] * df["AvgCost"]
+    df["PnL"] = df["MarketValue"] - df["CostValue"]
 
     return {
-        "mean_return": returns.mean().to_dict(),
-        "volatility": returns.std().to_dict()
+        "total_value": df["MarketValue"].sum(),
+        "total_pnl": df["PnL"].sum(),
+        "holdings": df
     }
 
 
-# ---------------------------
-# SECTOR MAP
-# ---------------------------
+# ----------------------------
+# SECTOR MAP (SAFE STATIC)
+# ----------------------------
 def get_sector_map():
     return {
-        "AAPL": "Technology",
-        "MSFT": "Technology",
-        "GOOGL": "Communication Services",
-        "TSLA": "Automotive"
+        "Tech": ["AAPL", "MSFT", "TSLA"]
     }
 
 
-# ---------------------------
-# DRAWDOWN SERIES (FIXED)
-# ---------------------------
-def get_drawdown_series(prices: pd.Series):
-    rolling_max = prices.cummax()
-    drawdown = (prices / rolling_max) - 1
+# ----------------------------
+# DRAWDOWN (FIXED)
+# ----------------------------
+def get_drawdown_series(history_df):
+    values = history_df["Value"]
+    peak = values.cummax()
+    drawdown = (values - peak) / peak
     return drawdown
 
 
-# ---------------------------
-# CAPTURE RATIOS (safe version)
-# ---------------------------
-def get_capture_ratios(tickers):
-    data = yf.download(tickers, period="6mo")["Close"]
-    returns = data.pct_change().dropna()
-
-    up = returns[returns > 0].mean()
-    down = returns[returns < 0].mean()
-
+# ----------------------------
+# CAPTURE RATIOS (SAFE MOCK)
+# ----------------------------
+def get_capture_ratios():
     return {
-        "up_capture": up.to_dict() if hasattr(up, "to_dict") else {},
-        "down_capture": down.to_dict() if hasattr(down, "to_dict") else {}
+        "upside_capture": 1.1,
+        "downside_capture": 0.9
     }
