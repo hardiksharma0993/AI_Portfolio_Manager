@@ -1,4 +1,3 @@
-import ollama
 import re
 
 MODEL_NAME = "qwen3:8b"
@@ -6,44 +5,75 @@ MODEL_NAME = "qwen3:8b"
 
 def _strip_think_tags(text: str) -> str:
     """
-    Qwen3 models emit <think>...</think> reasoning blocks before the final answer.
-    We strip those so only the clean response is shown in the dashboard.
+    Qwen3 models sometimes emit <think>...</think> reasoning blocks.
+    Remove them before displaying output.
     """
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if not text:
+        return ""
+
+    return re.sub(
+        r"<think>.*?</think>",
+        "",
+        text,
+        flags=re.DOTALL
+    ).strip()
 
 
 def ask_llm(prompt: str, system: str = None) -> str:
     """
-    Send a prompt to the local Ollama model and return the clean response.
+    Send a prompt to Ollama and return a clean response.
 
-    Args:
-        prompt: User-facing prompt / question.
-        system: Optional system message to set the model's persona/context.
+    This version safely handles:
+    - Ollama package not installed
+    - Ollama server not running
+    - Model not downloaded
+    - Any runtime errors
 
-    Returns:
-        Clean response string (think tags stripped for Qwen3 models).
+    The dashboard will continue working even if AI Insights fail.
     """
+
+    try:
+        import ollama
+    except Exception as e:
+        return (
+            "AI Insights unavailable.\n\n"
+            "Reason: Ollama package could not be loaded.\n"
+            f"Details: {str(e)}"
+        )
+
     messages = []
 
     if system:
-        messages.append({"role": "system", "content": system})
+        messages.append({
+            "role": "system",
+            "content": system
+        })
 
-    messages.append({"role": "user", "content": prompt})
+    messages.append({
+        "role": "user",
+        "content": prompt
+    })
 
     try:
         res = ollama.chat(
             model=MODEL_NAME,
             messages=messages,
             options={
-                "temperature": 0.3,      # Lower = more factual, less hallucination
-                "num_predict": 1024,     # Cap output length for dashboard use
+                "temperature": 0.3,
+                "num_predict": 1024
             }
         )
 
-        raw = res["message"]["content"]
+        raw = res.get("message", {}).get("content", "")
+
         return _strip_think_tags(raw)
 
-    except ollama.ResponseError as e:
-        return f"LLM ERROR (model response): {str(e)}"
     except Exception as e:
-        return f"LLM ERROR: {str(e)}"
+        return (
+            "AI Insights unavailable.\n\n"
+            "Possible causes:\n"
+            "- Ollama server is not running\n"
+            "- Model is not installed\n"
+            "- Network access to Ollama is blocked\n\n"
+            f"Error: {str(e)}"
+        )
