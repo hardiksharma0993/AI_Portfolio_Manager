@@ -40,7 +40,11 @@ st.sidebar.caption("Prices: Last available close (NSE). Updates reflect latest t
 # ================================
 # LOAD DATA
 # ================================
-df = load_portfolio()
+try:
+    df = load_portfolio()
+except Exception as e:
+    st.error(f"Failed to load portfolio.csv: {e}")
+    st.stop()
 
 with st.spinner("Fetching live prices..."):
     prices = get_current_prices(df)
@@ -100,7 +104,11 @@ st.divider()
 with st.spinner("Loading historical data..."):
     portfolio = get_portfolio_history()
 
-benchmark = yf.download("^NSEI", period="1y", auto_adjust=True, progress=False)["Close"]
+try:
+    benchmark = yf.download("^NSEI", period="1y", auto_adjust=True, progress=False)["Close"]
+except Exception:
+    st.error("Failed to fetch benchmark data from Yahoo Finance")
+    st.stop()
 
 # Flatten if needed
 if isinstance(benchmark, pd.DataFrame):
