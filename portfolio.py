@@ -39,7 +39,7 @@ def get_current_prices(df):
                 if not series.empty:
                     prices[t] = float(series.iloc[-1])
                 else:
-                    prices[t] = np.nan
+                    prices[t] = 0.0
             except Exception:
                 prices[t] = np.nan
 
@@ -86,7 +86,10 @@ def get_portfolio_history():
     df = load_portfolio()
     prices = get_historical_prices(df)
 
-    portfolio = pd.Series(0.0, index=prices.index)
+    if prices.empty:
+    return pd.Series(dtype=float)
+
+portfolio = pd.Series(0.0, index=prices.index)
 
     for _, row in df.iterrows():
         ticker = row["Ticker"]
@@ -135,39 +138,33 @@ def get_drawdown_series(portfolio=None):
 # Ratio > 100% upside and < 100% downside = ideal active manager
 # ================================
 def get_capture_ratios(portfolio_returns=None, benchmark_returns=None):
+    # Always safe fallback
     if portfolio_returns is None or benchmark_returns is None:
         metrics = get_metrics()
-        portfolio_returns = metrics["returns"]
-        benchmark_returns = metrics["benchmark_returns"]
+        portfolio_returns = metrics.get("returns", pd.Series(dtype=float))
+        benchmark_returns = metrics.get("benchmark_returns", pd.Series(dtype=float))
 
     aligned = pd.concat([portfolio_returns, benchmark_returns], axis=1).dropna()
+
+    if aligned.empty:
+        return {"upside_capture": 0.0, "downside_capture": 0.0}
+
     aligned.columns = ["p", "b"]
 
-    # Upside: periods where benchmark went UP
-    up_mask = aligned["b"] > 0
-    if up_mask.sum() > 0:
-        upside_capture = (
-            (1 + aligned.loc[up_mask, "p"]).prod() ** (252 / up_mask.sum()) - 1
-        ) / (
-            (1 + aligned.loc[up_mask, "b"]).prod() ** (252 / up_mask.sum()) - 1
-        ) * 100
-    else:
-        upside_capture = np.nan
+    up = aligned[aligned["b"] > 0]
+    down = aligned[aligned["b"] < 0]
 
-    # Downside: periods where benchmark went DOWN
-    down_mask = aligned["b"] < 0
-    if down_mask.sum() > 0:
-        downside_capture = (
-            (1 + aligned.loc[down_mask, "p"]).prod() ** (252 / down_mask.sum()) - 1
-        ) / (
-            (1 + aligned.loc[down_mask, "b"]).prod() ** (252 / down_mask.sum()) - 1
-        ) * 100
-    else:
-        downside_capture = np.nan
+    def capture(p, b):
+        if len(p) == 0 or len(b) == 0:
+            return 0.0
+        try:
+            return (p.mean() / (b.mean() + 1e-9)) * 100
+        except Exception:
+            return 0.0
 
     return {
-        "upside_capture": float(upside_capture) if not np.isnan(upside_capture) else 0.0,
-        "downside_capture": float(downside_capture) if not np.isnan(downside_capture) else 0.0
+        "upside_capture": float(capture(up["p"], up["b"])),
+        "downside_capture": float(capture(down["p"], down["b"]))
     }
 
 
@@ -186,7 +183,19 @@ def get_metrics():
         benchmark = benchmark.iloc[:, 0]
 
     aligned = pd.concat([returns, benchmark], axis=1).dropna()
-    aligned.columns = ["p", "b"]
+
+if aligned.empty:
+    return {
+        "annual_return": 0.0,
+        "volatility": 0.0,
+        "sharpe": 0.0,
+        "beta": 0.0,
+        "max_drawdown": 0.0,
+        "returns": pd.Series(dtype=float),
+        "benchmark_returns": pd.Series(dtype=float)
+    }
+
+aligned.columns = ["p", "b"]
 
     annual_return = float(aligned["p"].mean() * 252)
     volatility = float(aligned["p"].std() * np.sqrt(252))
