@@ -2,9 +2,9 @@ import pandas as pd
 import yfinance as yf
 
 
-# ----------------------------
-# LOAD PORTFOLIO
-# ----------------------------
+# -------------------------
+# PORTFOLIO DATA
+# -------------------------
 def load_portfolio():
     return pd.DataFrame({
         "Ticker": ["AAPL", "TSLA", "MSFT"],
@@ -13,15 +13,15 @@ def load_portfolio():
     })
 
 
-# ----------------------------
-# GET CURRENT PRICES (FIXED)
-# ----------------------------
+# -------------------------
+# SAFE PRICE FETCH
+# -------------------------
 def get_current_prices(tickers):
     prices = {}
 
     for t in tickers:
         try:
-            data = yf.Ticker(t).history(period="1d")
+            data = yf.download(t, period="5d", progress=False)
 
             if data is not None and not data.empty:
                 prices[t] = float(data["Close"].iloc[-1])
@@ -34,19 +34,19 @@ def get_current_prices(tickers):
     return prices
 
 
-# ----------------------------
-# PORTFOLIO HISTORY (MOCK SAFE)
-# ----------------------------
+# -------------------------
+# HISTORY (SIMPLE MOCK)
+# -------------------------
 def get_portfolio_history():
     return pd.DataFrame({
-        "Date": pd.date_range("2024-01-01", periods=5),
-        "Value": [10000, 10500, 10200, 11000, 11500]
+        "Date": pd.date_range("2024-01-01", periods=6),
+        "Value": [10000, 10200, 10100, 10500, 10700, 11000]
     })
 
 
-# ----------------------------
-# METRICS
-# ----------------------------
+# -------------------------
+# METRICS (FIXED)
+# -------------------------
 def get_metrics(df, prices):
     df = df.copy()
 
@@ -56,36 +56,35 @@ def get_metrics(df, prices):
     df["PnL"] = df["MarketValue"] - df["CostValue"]
 
     return {
-        "total_value": df["MarketValue"].sum(),
-        "total_pnl": df["PnL"].sum(),
+        "total_value": float(df["MarketValue"].sum()),
+        "total_pnl": float(df["PnL"].sum()),
         "holdings": df
     }
 
 
-# ----------------------------
-# SECTOR MAP (SAFE STATIC)
-# ----------------------------
+# -------------------------
+# SECTOR MAP
+# -------------------------
 def get_sector_map():
     return {
         "Tech": ["AAPL", "MSFT", "TSLA"]
     }
 
 
-# ----------------------------
-# DRAWDOWN (FIXED)
-# ----------------------------
+# -------------------------
+# DRAWDOWN
+# -------------------------
 def get_drawdown_series(history_df):
-    values = history_df["Value"]
-    peak = values.cummax()
-    drawdown = (values - peak) / peak
+    peak = history_df["Value"].cummax()
+    drawdown = (history_df["Value"] - peak) / peak
     return drawdown
 
 
-# ----------------------------
-# CAPTURE RATIOS (SAFE MOCK)
-# ----------------------------
+# -------------------------
+# CAPTURE RATIOS (MOCK)
+# -------------------------
 def get_capture_ratios():
     return {
-        "upside_capture": 1.1,
-        "downside_capture": 0.9
+        "upside_capture": 1.12,
+        "downside_capture": 0.88
     }

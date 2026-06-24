@@ -1,9 +1,6 @@
 import streamlit as st
 import pandas as pd
-import plotly.graph_objects as go
 import plotly.express as px
-import yfinance as yf
-import time
 
 from portfolio import (
     load_portfolio,
@@ -15,169 +12,90 @@ from portfolio import (
     get_capture_ratios
 )
 
-from llm import ask_llm
+
+# -------------------------
+# APP CONFIG
+# -------------------------
+st.set_page_config(page_title="Portfolio Dashboard", layout="wide")
+
+st.title("📊 AI Portfolio Dashboard")
 
 
-# ================================
-# CONFIG
-# ================================
-st.set_page_config(page_title="Portfolio Intelligence", layout="wide")
-st.title("📊 Pro Portfolio Intelligence Dashboard")
+# -------------------------
+# LOAD DATA
+# -------------------------
+portfolio = load_portfolio()
+
+tickers = portfolio["Ticker"].tolist()
+prices = get_current_prices(tickers)
+
+metrics = get_metrics(portfolio, prices)
 
 
-# ================================
-# SAFE LOAD PORTFOLIO
-# ================================
-try:
-    df = load_portfolio()
-except Exception as e:
-    st.error(f"❌ Failed to load portfolio.csv: {e}")
+# -------------------------
+# SAFETY CHECKS
+# -------------------------
+if not prices:
+    st.warning("⚠️ No prices fetched")
+
+if "total_value" not in metrics:
+    st.error("Metrics calculation failed")
     st.stop()
 
 
-# ================================
-# SAFE PRICE FETCH
-# ================================
-sector_map = get_sector_map()
+# -------------------------
+# KPIs
+# -------------------------
+col1, col2, col3 = st.columns(3)
 
-try:
-    with st.spinner("Fetching live prices..."):
-        prices = get_current_prices(df)
-except Exception as e:
-    st.warning(f"⚠️ Price fetch failed: {e}")
-    prices = {}
-
-df["CurrentPrice"] = df["Ticker"].apply(lambda x: prices.get(x, 0))
-df["Value"] = df["CurrentPrice"] * df["Shares"]
-df["Sector"] = df["Ticker"].map(sector_map).fillna("Other")
-df["Weight"] = df["Value"] / df["Value"].sum()
-
-total_value = df["Value"].sum()
-
-missing = df[df["CurrentPrice"].isna() | (df["CurrentPrice"] == 0)]["Ticker"].tolist()
-if missing:
-    st.warning(f"⚠️ Missing prices: {', '.join(missing)}")
+col1.metric("Portfolio Value", f"${metrics['total_value']:.2f}")
+col2.metric("Total PnL", f"${metrics['total_pnl']:.2f}")
+col3.metric("Holdings", len(portfolio))
 
 
-# ================================
-# SAFE METRICS
-# ================================
-try:
-    metrics = get_metrics()
-except Exception as e:
-    st.error(f"❌ Metrics calculation failed: {e}")
-    st.stop()
+# -------------------------
+# HOLDINGS TABLE
+# -------------------------
+st.subheader("Holdings")
 
-capture = get_capture_ratios(
-    portfolio_returns=metrics["returns"],
-    benchmark_returns=metrics["benchmark_returns"]
-)
+st.dataframe(metrics["holdings"], use_container_width=True)
 
 
-# ================================
-# DASHBOARD METRICS
-# ================================
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Portfolio Value", f"₹{total_value:,.0f}")
-c2.metric("Annual Return", f"{metrics['annual_return']:.2%}")
-c3.metric("Sharpe Ratio", f"{metrics['sharpe']:.2f}")
-c4.metric("Beta", f"{metrics['beta']:.2f}")
+# -------------------------
+# PORTFOLIO HISTORY
+# -------------------------
+st.subheader("Portfolio History")
 
-c5, c6, c7, c8 = st.columns(4)
-c5.metric("Max Drawdown", f"{metrics['max_drawdown']:.2%}", delta_color="inverse")
-c6.metric("Volatility", f"{metrics['volatility']:.2%}")
-c7.metric("Upside Capture", f"{capture['upside_capture']:.1f}%")
-c8.metric("Downside Capture", f"{capture['downside_capture']:.1f}%")
+history = get_portfolio_history()
+
+fig = px.line(history, x="Date", y="Value", title="Portfolio Value Over Time")
+st.plotly_chart(fig, use_container_width=True)
 
 
-st.divider()
-
-
-# ================================
-# PORTFOLIO VS BENCHMARK
-# ================================
-portfolio = get_portfolio_history()
-
-try:
-    benchmark_data = yf.download("^NSEI", period="1y", auto_adjust=True, progress=False)
-    benchmark = benchmark_data["Close"]
-except Exception as e:
-    st.error(f"❌ Benchmark fetch failed: {e}")
-    st.stop()
-
-aligned = pd.concat([portfolio, benchmark], axis=1).dropna()
-aligned.columns = ["Portfolio", "NIFTY"]
-
-portfolio_norm = aligned["Portfolio"] / aligned["Portfolio"].iloc[0]
-nifty_norm = aligned["NIFTY"] / aligned["NIFTY"].iloc[0]
-
-fig1 = go.Figure()
-fig1.add_trace(go.Scatter(x=portfolio_norm.index, y=portfolio_norm.values, name="Portfolio"))
-fig1.add_trace(go.Scatter(x=nifty_norm.index, y=nifty_norm.values, name="NIFTY"))
-st.plotly_chart(fig1, use_container_width=True)
-
-
-# ================================
+# -------------------------
 # DRAWDOWN
-# ================================
-drawdown = get_drawdown_series(portfolio)
+# -------------------------
+st.subheader("Drawdown")
 
-fig_dd = go.Figure()
-fig_dd.add_trace(go.Scatter(
-    x=drawdown.index,
-    y=drawdown.values * 100,
-    fill="tozeroy",
-    name="Drawdown"
-))
-st.plotly_chart(fig_dd, use_container_width=True)
+drawdown = get_drawdown_series(history)
 
-
-# ================================
-# ALLOCATION
-# ================================
-fig2 = px.pie(df, names="Ticker", values="Value")
+fig2 = px.area(drawdown, title="Drawdown Curve")
 st.plotly_chart(fig2, use_container_width=True)
 
 
-# ================================
-# SECTOR
-# ================================
-sector_alloc = df.groupby("Sector")["Value"].sum().reset_index()
+# -------------------------
+# SECTOR ALLOCATION
+# -------------------------
+st.subheader("Sector Map")
 
-fig3 = px.bar(sector_alloc, x="Sector", y="Value")
-st.plotly_chart(fig3, use_container_width=True)
+sector_map = get_sector_map()
 
-
-# ================================
-# HOLDINGS TABLE
-# ================================
-st.subheader("Holdings")
-st.dataframe(df)
+st.json(sector_map)
 
 
-# ================================
-# AI INSIGHTS
-# ================================
-st.subheader("🤖 AI Insights")
+# -------------------------
+# CAPTURE RATIOS
+# -------------------------
+st.subheader("Capture Ratios")
 
-if st.button("Generate AI Insights"):
-    try:
-        prompt = f"""
-Portfolio Value: ₹{total_value:,.0f}
-Return: {metrics['annual_return']:.2%}
-Sharpe: {metrics['sharpe']:.2f}
-Beta: {metrics['beta']:.2f}
-Max Drawdown: {metrics['max_drawdown']:.2%}
-
-Holdings:
-{df[['Ticker','Shares','Value','Weight','Sector']].to_string(index=False)}
-
-Give 3 key insights.
-"""
-        response = ask_llm(prompt)
-        st.success(response)
-    except Exception as e:
-        st.error(f"AI failed: {e}")
-
-
-st.caption("Powered by Yahoo Finance + Streamlit")
+st.json(get_capture_ratios())
