@@ -7,7 +7,14 @@ import yfinance as yf
 # LOAD PORTFOLIO
 # ================================
 def load_portfolio():
-    return pd.read_csv("data/portfolio.csv")
+    import os
+import pandas as pd
+
+def load_portfolio():
+    path = "data/portfolio.csv"
+    if not os.path.exists(path):
+        raise FileNotFoundError("data/portfolio.csv missing in repo")
+    return pd.read_csv(path)
 
 
 # ================================
