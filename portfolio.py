@@ -28,18 +28,18 @@ def get_current_prices(df):
             group_by="ticker"
         )
 
+        # Don't guess shape from len(tickers) == 1 — check the actual columns.
+        # yfinance's column structure can vary by version even for single tickers.
+        is_multi = isinstance(raw.columns, pd.MultiIndex)
+
         for t in tickers:
             try:
-                if len(tickers) == 1:
-                    # Single ticker: columns are flat
-                    series = raw["Close"].dropna()
-                else:
+                if is_multi:
                     series = raw[t]["Close"].dropna()
-
-                if not series.empty:
-                    prices[t] = float(series.iloc[-1])
                 else:
-                    prices[t] = 0.0
+                    series = raw["Close"].dropna()
+
+                prices[t] = float(series.iloc[-1]) if not series.empty else np.nan
             except Exception:
                 prices[t] = np.nan
 
@@ -58,12 +58,12 @@ def get_current_prices(df):
 # ================================
 # HISTORICAL PRICES (1Y, BATCH)
 # ================================
-def get_historical_prices(df):
+def get_historical_prices(df, period="1y"):
     tickers = df["Ticker"].tolist()
 
     data = yf.download(
         tickers=tickers,
-        period="1y",
+        period=period,
         auto_adjust=True,
         progress=False
     )
@@ -87,9 +87,9 @@ def get_portfolio_history():
     prices = get_historical_prices(df)
 
     if prices.empty:
-    return pd.Series(dtype=float)
+        return pd.Series(dtype=float)
 
-portfolio = pd.Series(0.0, index=prices.index)
+    portfolio = pd.Series(0.0, index=prices.index)
 
     for _, row in df.iterrows():
         ticker = row["Ticker"]
@@ -133,8 +133,8 @@ def get_drawdown_series(portfolio=None):
 
 # ================================
 # CAPTURE RATIOS
-# Upside Capture: how much of benchmark UP months portfolio captures
-# Downside Capture: how much of benchmark DOWN months portfolio captures
+# Upside Capture: how much of benchmark UP-day returns the portfolio captures
+# Downside Capture: how much of benchmark DOWN-day returns the portfolio captures
 # Ratio > 100% upside and < 100% downside = ideal active manager
 # ================================
 def get_capture_ratios(portfolio_returns=None, benchmark_returns=None):
@@ -184,18 +184,18 @@ def get_metrics():
 
     aligned = pd.concat([returns, benchmark], axis=1).dropna()
 
-if aligned.empty:
-    return {
-        "annual_return": 0.0,
-        "volatility": 0.0,
-        "sharpe": 0.0,
-        "beta": 0.0,
-        "max_drawdown": 0.0,
-        "returns": pd.Series(dtype=float),
-        "benchmark_returns": pd.Series(dtype=float)
-    }
+    if aligned.empty:
+        return {
+            "annual_return": 0.0,
+            "volatility": 0.0,
+            "sharpe": 0.0,
+            "beta": 0.0,
+            "max_drawdown": 0.0,
+            "returns": pd.Series(dtype=float),
+            "benchmark_returns": pd.Series(dtype=float)
+        }
 
-aligned.columns = ["p", "b"]
+    aligned.columns = ["p", "b"]
 
     annual_return = float(aligned["p"].mean() * 252)
     volatility = float(aligned["p"].std() * np.sqrt(252))
@@ -232,4 +232,116 @@ def get_sector_map():
         "ITC.NS": "FMCG",
         "NIFTYBEES.NS": "ETF",
         "GOLDBEES.NS": "Gold"
+    }
+
+
+# ================================
+# GENERIC SERIES STATS
+# Used to score any equity curve (backtest legs, benchmark, etc.)
+# ================================
+def compute_series_stats(series, risk_free_rate=0.06):
+    series = series.dropna()
+    returns = series.pct_change().dropna()
+
+    if returns.empty or len(series) < 2:
+        return {"cagr": 0.0, "volatility": 0.0, "sharpe": 0.0, "max_drawdown": 0.0}
+
+    n_years = len(returns) / 252
+    total_return = series.iloc[-1] / series.iloc[0]
+
+    cagr = float(total_return ** (1 / n_years) - 1) if n_years > 0 else 0.0
+    volatility = float(returns.std() * np.sqrt(252))
+    sharpe = (cagr - risk_free_rate) / (volatility + 1e-9)
+
+    cum = series / series.iloc[0]
+    dd = cum / cum.cummax() - 1
+    max_dd = float(dd.min())
+
+    return {
+        "cagr": cagr,
+        "volatility": volatility,
+        "sharpe": float(sharpe),
+        "max_drawdown": max_dd
+    }
+
+
+# ================================
+# BACKTEST ENGINE
+# Simulates two strategies over the same historical window using the
+# CURRENT portfolio's tickers and target weights (derived from live shares):
+#   1. Buy & Hold      — weights drift naturally with price moves, never rebalanced
+#   2. Rebalanced      — weights pulled back to target at a chosen frequency,
+#                        with a simple proportional transaction-cost drag
+# ================================
+def run_backtest(rebalance_freq="Monthly", transaction_cost_bps=10.0, period="1y"):
+    df = load_portfolio()
+    prices = get_historical_prices(df, period=period)
+
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if not tickers:
+        return None
+
+    df = df.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna(how="all")
+    prices = prices.dropna()  # require full history across all holdings for a clean sim
+
+    if prices.empty or len(prices) < 2:
+        return None
+
+    # Target weights derived from most recent prices * current shares held
+    latest_prices = prices.iloc[-1]
+    dollar_values = df["Shares"] * latest_prices
+    target_weights = dollar_values / dollar_values.sum()
+
+    returns = prices.pct_change().fillna(0.0)
+    dates = prices.index
+
+    # Determine rebalance dates
+    rebal_dates = set()
+    if rebalance_freq != "None":
+        freq_map = {"Weekly": "W", "Monthly": "ME", "Quarterly": "QE"}
+        freq_code = freq_map.get(rebalance_freq, "ME")
+        resampled = prices.resample(freq_code).first()
+        rebal_dates = set(resampled.index)
+
+    weights = target_weights.copy()
+    bh_weights = target_weights.copy()
+
+    equity = [1.0]
+    equity_bh = [1.0]
+    total_cost = 0.0
+
+    for i in range(1, len(dates)):
+        day_ret_active = float((weights * returns.iloc[i]).sum())
+        day_ret_bh = float((bh_weights * returns.iloc[i]).sum())
+
+        equity.append(equity[-1] * (1 + day_ret_active))
+        equity_bh.append(equity_bh[-1] * (1 + day_ret_bh))
+
+        # Weights drift with price moves each day
+        weights = weights * (1 + returns.iloc[i])
+        weights = weights / weights.sum()
+
+        bh_weights = bh_weights * (1 + returns.iloc[i])
+        bh_weights = bh_weights / bh_weights.sum()
+
+        # On a rebalance date, pull the active leg back to target and charge turnover cost
+        if dates[i] in rebal_dates:
+            turnover = float((weights - target_weights).abs().sum())
+            cost = turnover * (transaction_cost_bps / 10000.0)
+            equity[-1] *= (1 - cost)
+            total_cost += cost
+            weights = target_weights.copy()
+
+    rebal_series = pd.Series(equity, index=dates, name="Rebalanced")
+    bh_series = pd.Series(equity_bh, index=dates, name="BuyAndHold")
+
+    return {
+        "rebalanced": rebal_series,
+        "buy_and_hold": bh_series,
+        "total_transaction_cost": total_cost,
+        "target_weights": target_weights
     }

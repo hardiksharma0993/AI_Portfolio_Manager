@@ -10,11 +10,12 @@ from portfolio import (
     load_portfolio,
     get_current_prices,
     get_portfolio_history,
-    get_total_value,
     get_metrics,
     get_sector_map,
     get_drawdown_series,
-    get_capture_ratios
+    get_capture_ratios,
+    run_backtest,
+    compute_series_stats
 )
 
 from llm import ask_llm
@@ -271,6 +272,91 @@ display_df["Value"] = display_df["Value"].map(lambda x: f"₹{x:,.0f}" if pd.not
 display_df["Weight"] = display_df["Weight"].map(lambda x: f"{x:.2%}" if pd.notna(x) else "N/A")
 st.dataframe(display_df, use_container_width=True)
 
+st.divider()
+
+
+# ================================
+# BACKTEST ENGINE
+# ================================
+st.subheader("🔁 Backtest Engine")
+st.caption("Simulates your current holdings/weights over their trailing history: rebalanced vs buy-and-hold.")
+
+bt_col1, bt_col2, bt_col3 = st.columns(3)
+with bt_col1:
+    rebalance_freq = st.selectbox("Rebalancing Frequency", ["None", "Weekly", "Monthly", "Quarterly"], index=2)
+with bt_col2:
+    txn_cost = st.slider("Transaction Cost (bps per rebalance)", 0, 50, 10)
+with bt_col3:
+    bt_period = st.selectbox("Lookback Window", ["6mo", "1y", "2y"], index=1)
+
+if st.button("Run Backtest"):
+    with st.spinner("Running backtest simulation..."):
+        bt_result = run_backtest(
+            rebalance_freq=rebalance_freq,
+            transaction_cost_bps=txn_cost,
+            period=bt_period
+        )
+
+    if bt_result is None:
+        st.error("Not enough overlapping historical data across your holdings to run a backtest.")
+    else:
+        rebal_series = bt_result["rebalanced"]
+        bh_series = bt_result["buy_and_hold"]
+
+        fig_bt = go.Figure()
+        fig_bt.add_trace(go.Scatter(
+            x=rebal_series.index, y=rebal_series.values,
+            name=f"Rebalanced ({rebalance_freq})", line=dict(color="#00C897", width=2)
+        ))
+        fig_bt.add_trace(go.Scatter(
+            x=bh_series.index, y=bh_series.values,
+            name="Buy & Hold", line=dict(color="#FFA500", width=2, dash="dash")
+        ))
+        fig_bt.update_layout(
+            title=f"Backtest ({bt_period}): Rebalanced vs Buy & Hold — Growth of ₹1",
+            xaxis_title="Date",
+            yaxis_title="Growth of ₹1",
+            hovermode="x unified"
+        )
+        st.plotly_chart(fig_bt, use_container_width=True)
+
+        stats_rebal = compute_series_stats(rebal_series)
+        stats_bh = compute_series_stats(bh_series)
+
+        stats_df = pd.DataFrame({
+            "Rebalanced": stats_rebal,
+            "Buy & Hold": stats_bh
+        }).T
+        stats_df = stats_df.rename(columns={
+            "cagr": "CAGR",
+            "volatility": "Volatility",
+            "sharpe": "Sharpe",
+            "max_drawdown": "Max Drawdown"
+        })
+        stats_df["CAGR"] = stats_df["CAGR"].map(lambda x: f"{x:.2%}")
+        stats_df["Volatility"] = stats_df["Volatility"].map(lambda x: f"{x:.2%}")
+        stats_df["Sharpe"] = stats_df["Sharpe"].map(lambda x: f"{x:.2f}")
+        stats_df["Max Drawdown"] = stats_df["Max Drawdown"].map(lambda x: f"{x:.2%}")
+
+        st.dataframe(stats_df, use_container_width=True)
+
+        if rebalance_freq != "None":
+            st.caption(
+                f"Cumulative transaction-cost drag from rebalancing: "
+                f"{bt_result['total_transaction_cost']:.4%} of portfolio value over the window."
+            )
+
+        with st.expander("ℹ️ How this backtest works"):
+            st.markdown("""
+            - **Target weights** come from your current holdings (shares × latest price).
+            - **Buy & Hold** starts at those weights and lets them drift naturally with price moves — no trading.
+            - **Rebalanced** periodically sells winners / buys laggards back to the target weights,
+              paying a simple proportional transaction cost (in bps) on the turnover at each rebalance.
+            - This is a simplified simulation: it ignores dividends, taxes, and intraday slippage.
+            """)
+
+st.divider()
+
 
 # ================================
 # SMART INSIGHTS (AI-POWERED)
@@ -320,4 +406,4 @@ Keep it concise and analytical. Avoid generic advice.
 # ================================
 # FOOTNOTE
 # ================================
-st.caption("Data via Yahoo Finance. Prices reflect the last available trading session close. Capture ratios computed vs NIFTY 50 on a 1-year daily return basis.")
+st.caption("Data via Yahoo Finance. Prices reflect the last available trading session close. Capture ratios and backtests computed vs NIFTY 50 / current holdings on a daily-return basis.")

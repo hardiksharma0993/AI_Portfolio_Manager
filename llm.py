@@ -24,10 +24,8 @@ def ask_llm(prompt: str, system: str = None) -> str:
         Clean response string (think tags stripped for Qwen3 models).
     """
     messages = []
-
     if system:
         messages.append({"role": "system", "content": system})
-
     messages.append({"role": "user", "content": prompt})
 
     try:
@@ -39,10 +37,8 @@ def ask_llm(prompt: str, system: str = None) -> str:
                 "num_predict": 1024,     # Cap output length for dashboard use
             }
         )
-
         raw = res["message"]["content"]
         return _strip_think_tags(raw)
-
     except ollama.ResponseError as e:
         return f"LLM ERROR (model response): {str(e)}"
     except Exception as e:

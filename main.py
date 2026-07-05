@@ -3,7 +3,9 @@ from portfolio import (
     get_metrics,
     get_portfolio_history,
     get_capture_ratios,
-    get_drawdown_series
+    get_drawdown_series,
+    run_backtest,
+    compute_series_stats
 )
 
 from llm import ask_llm
@@ -16,9 +18,10 @@ Available commands:
   capture     — Upside / Downside capture ratios vs NIFTY 50
   drawdown    — Maximum drawdown and current drawdown from peak
   portfolio   — Last 10 days of portfolio value series
+  backtest    — Run rebalanced vs buy-and-hold backtest (1Y, monthly rebalance)
   help        — Show this help
   exit        — Quit
-  
+
 Or type any free-form question and the AI will answer it.
 """
 
@@ -87,6 +90,37 @@ Comment on the trend, any notable moves, and overall direction.
     return ask_llm(prompt)
 
 
+def handle_backtest():
+    result = run_backtest(rebalance_freq="Monthly", transaction_cost_bps=10.0, period="1y")
+
+    if result is None:
+        return "Not enough overlapping historical data across holdings to run a backtest."
+
+    stats_rebal = compute_series_stats(result["rebalanced"])
+    stats_bh = compute_series_stats(result["buy_and_hold"])
+
+    prompt = f"""
+Backtest Results (1Y, monthly rebalance, 10bps transaction cost):
+
+Rebalanced strategy:
+- CAGR: {stats_rebal['cagr']:.2%}
+- Volatility: {stats_rebal['volatility']:.2%}
+- Sharpe: {stats_rebal['sharpe']:.2f}
+- Max Drawdown: {stats_rebal['max_drawdown']:.2%}
+
+Buy & Hold strategy:
+- CAGR: {stats_bh['cagr']:.2%}
+- Volatility: {stats_bh['volatility']:.2%}
+- Sharpe: {stats_bh['sharpe']:.2f}
+- Max Drawdown: {stats_bh['max_drawdown']:.2%}
+
+Total transaction cost drag from rebalancing: {result['total_transaction_cost']:.4%}
+
+Compare the two strategies and explain which performed better on a risk-adjusted basis and why.
+"""
+    return ask_llm(prompt)
+
+
 def main():
     print("\n📊 Portfolio AI Assistant")
     print(HELP_TEXT)
@@ -128,6 +162,9 @@ def main():
 
             elif lower_q == "portfolio":
                 print(handle_portfolio())
+
+            elif lower_q == "backtest":
+                print(handle_backtest())
 
             else:
                 # Free-form: pass raw question to LLM with portfolio context
