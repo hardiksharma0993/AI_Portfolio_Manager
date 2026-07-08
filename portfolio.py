@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
+from scipy.optimize import minimize
 
 
 # ================================
@@ -56,17 +57,28 @@ def get_current_prices(df):
 
 
 # ================================
-# HISTORICAL PRICES (1Y, BATCH)
+# HISTORICAL PRICES (BATCH)
+# Pass either `period` (e.g. "1y") OR an explicit `start`/`end` date range.
+# start/end take priority over period when both are given.
 # ================================
-def get_historical_prices(df, period="1y"):
+def get_historical_prices(df, period="1y", start=None, end=None):
     tickers = df["Ticker"].tolist()
 
-    data = yf.download(
-        tickers=tickers,
-        period=period,
-        auto_adjust=True,
-        progress=False
-    )
+    if start is not None:
+        data = yf.download(
+            tickers=tickers,
+            start=start,
+            end=end,
+            auto_adjust=True,
+            progress=False
+        )
+    else:
+        data = yf.download(
+            tickers=tickers,
+            period=period,
+            auto_adjust=True,
+            progress=False
+        )
 
     # Flatten MultiIndex — always keep "Close" level
     if isinstance(data.columns, pd.MultiIndex):
@@ -221,6 +233,56 @@ def get_metrics():
 
 
 # ================================
+# BENCHMARK OPTIONS
+# ================================
+BENCHMARK_OPTIONS = {
+    "NIFTY 50": "^NSEI",
+    "Sensex": "^BSESN",
+    "Nifty Bank": "^NSEBANK",
+    "Nifty Next 50": "^NSMIDCP"
+}
+
+
+def get_benchmark_history(ticker="^NSEI", period="1y", start=None, end=None):
+    if start is not None:
+        data = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)["Close"]
+    else:
+        data = yf.download(ticker, period=period, auto_adjust=True, progress=False)["Close"]
+
+    if isinstance(data, pd.DataFrame):
+        data = data.iloc[:, 0]
+
+    return data.dropna()
+
+
+# ================================
+# CORRELATION MATRIX
+# Daily-return correlation across holdings — complements the efficient
+# frontier by showing *why* diversification helps (or doesn't).
+# ================================
+def get_correlation_matrix(include_tickers=None, period="1y"):
+    df = load_portfolio()
+
+    if include_tickers:
+        df = df[df["Ticker"].isin(include_tickers)]
+
+    prices = get_historical_prices(df, period=period)
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if len(tickers) < 2:
+        return None
+
+    prices = prices[tickers].dropna()
+    if prices.empty or len(prices) < 2:
+        return None
+
+    returns = prices.pct_change().dropna()
+    return returns.corr()
+
+
+# ================================
 # SECTOR MAP
 # ================================
 def get_sector_map():
@@ -270,12 +332,40 @@ def compute_series_stats(series, risk_free_rate=0.06):
 # Simulates two strategies over the same historical window using the
 # CURRENT portfolio's tickers and target weights (derived from live shares):
 #   1. Buy & Hold      — weights drift naturally with price moves, never rebalanced
-#   2. Rebalanced      — weights pulled back to target at a chosen frequency,
+#   2. Rebalanced      — weights pulled back to a target at a chosen frequency,
 #                        with a simple proportional transaction-cost drag
+#
+# Filters supported:
+#   - include_tickers:   restrict the simulation to a subset of your holdings
+#   - period / (start,end): preset lookback OR an explicit custom date range
+#   - benchmark_ticker:  overlay an index series over the same window for comparison
+#   - risk_free_rate:    used when scoring the two equity curves
+#   - rebalance_mode:
+#       "fixed"     — rebalance back to the current live target weights (default)
+#       "optimized" — walk-forward: at each rebalance date, re-solve for the
+#                     max-Sharpe weights using only trailing data up to that
+#                     date (no lookahead), then hold until the next rebalance
 # ================================
-def run_backtest(rebalance_freq="Monthly", transaction_cost_bps=10.0, period="1y"):
+def run_backtest(
+    rebalance_freq="Monthly",
+    transaction_cost_bps=10.0,
+    period="1y",
+    start=None,
+    end=None,
+    include_tickers=None,
+    benchmark_ticker="^NSEI",
+    risk_free_rate=0.06,
+    rebalance_mode="fixed",
+    optimizer_lookback_days=126
+):
     df = load_portfolio()
-    prices = get_historical_prices(df, period=period)
+
+    if include_tickers:
+        df = df[df["Ticker"].isin(include_tickers)]
+        if df.empty:
+            return None
+
+    prices = get_historical_prices(df, period=period, start=start, end=end)
 
     if prices.empty:
         return None
@@ -328,20 +418,197 @@ def run_backtest(rebalance_freq="Monthly", transaction_cost_bps=10.0, period="1y
         bh_weights = bh_weights * (1 + returns.iloc[i])
         bh_weights = bh_weights / bh_weights.sum()
 
-        # On a rebalance date, pull the active leg back to target and charge turnover cost
+        # On a rebalance date, reset the active leg and charge turnover cost
         if dates[i] in rebal_dates:
-            turnover = float((weights - target_weights).abs().sum())
+            if rebalance_mode == "optimized":
+                # Walk-forward: only use data up to (and including) today — no lookahead
+                trailing = returns.iloc[max(0, i - optimizer_lookback_days):i + 1]
+                if len(trailing) >= 30:
+                    mean_ret = trailing.mean() * 252
+                    cov = trailing.cov() * 252
+                    try:
+                        new_weights_arr = optimize_max_sharpe(mean_ret, cov, risk_free_rate, bounds=(0, 1))
+                        rebalance_target = pd.Series(new_weights_arr, index=mean_ret.index)
+                    except Exception:
+                        rebalance_target = target_weights
+                else:
+                    rebalance_target = target_weights
+            else:
+                rebalance_target = target_weights
+
+            turnover = float((weights - rebalance_target).abs().sum())
             cost = turnover * (transaction_cost_bps / 10000.0)
             equity[-1] *= (1 - cost)
             total_cost += cost
-            weights = target_weights.copy()
+            weights = rebalance_target.copy()
 
     rebal_series = pd.Series(equity, index=dates, name="Rebalanced")
     bh_series = pd.Series(equity_bh, index=dates, name="BuyAndHold")
 
-    return {
+    result = {
         "rebalanced": rebal_series,
         "buy_and_hold": bh_series,
         "total_transaction_cost": total_cost,
-        "target_weights": target_weights
+        "target_weights": target_weights,
+        "tickers_used": tickers
+    }
+
+    # Optional benchmark overlay over the identical window
+    if benchmark_ticker:
+        try:
+            bench = get_benchmark_history(benchmark_ticker, period=period, start=dates[0], end=dates[-1])
+            bench = bench.reindex(dates).ffill().dropna()
+            if not bench.empty:
+                result["benchmark"] = bench / bench.iloc[0]
+        except Exception:
+            pass
+
+    return result
+
+
+# ================================
+# MEAN-VARIANCE OPTIMIZER / EFFICIENT FRONTIER
+# Classic Markowitz optimization using scipy.optimize (SLSQP).
+# All weights sum to 1. Long-only by default (bounds 0-1); pass
+# bounds=(-1, 1) to allow shorting.
+# ================================
+def portfolio_performance(weights, mean_returns, cov_matrix):
+    """Returns (annualised return, annualised volatility) for a weight vector."""
+    weights = np.array(weights)
+    ret = float(np.dot(weights, mean_returns))
+    vol = float(np.sqrt(np.dot(weights.T, np.dot(cov_matrix, weights))))
+    return ret, vol
+
+
+def _neg_sharpe(weights, mean_returns, cov_matrix, risk_free_rate):
+    ret, vol = portfolio_performance(weights, mean_returns, cov_matrix)
+    return -(ret - risk_free_rate) / (vol + 1e-9)
+
+
+def _portfolio_vol(weights, mean_returns, cov_matrix):
+    return portfolio_performance(weights, mean_returns, cov_matrix)[1]
+
+
+def optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate=0.06, bounds=(0, 1)):
+    """Solves for the weight vector that maximizes the Sharpe ratio (the tangency portfolio)."""
+    n = len(mean_returns)
+    constraints = ({"type": "eq", "fun": lambda w: np.sum(w) - 1},)
+    bounds_list = tuple(bounds for _ in range(n))
+    init_guess = np.array(n * [1.0 / n])
+
+    result = minimize(
+        _neg_sharpe, init_guess, args=(mean_returns, cov_matrix, risk_free_rate),
+        method="SLSQP", bounds=bounds_list, constraints=constraints
+    )
+    return result.x if result.success else init_guess
+
+
+def optimize_min_volatility(mean_returns, cov_matrix, target_return=None, bounds=(0, 1)):
+    """Solves for the minimum-volatility weight vector, optionally constrained to a target return."""
+    n = len(mean_returns)
+    constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
+
+    if target_return is not None:
+        constraints.append({
+            "type": "eq",
+            "fun": lambda w: portfolio_performance(w, mean_returns, cov_matrix)[0] - target_return
+        })
+
+    bounds_list = tuple(bounds for _ in range(n))
+    init_guess = np.array(n * [1.0 / n])
+
+    result = minimize(
+        _portfolio_vol, init_guess, args=(mean_returns, cov_matrix),
+        method="SLSQP", bounds=bounds_list, constraints=constraints
+    )
+    return result.x if result.success else init_guess
+
+
+def compute_efficient_frontier(mean_returns, cov_matrix, n_points=40, bounds=(0, 1)):
+    """Sweeps target returns from min to max asset return and solves min-vol at each point."""
+    min_ret = float(mean_returns.min())
+    max_ret = float(mean_returns.max())
+    target_returns = np.linspace(min_ret, max_ret, n_points)
+
+    frontier_ret, frontier_vol = [], []
+    for t in target_returns:
+        try:
+            w = optimize_min_volatility(mean_returns, cov_matrix, target_return=t, bounds=bounds)
+            ret, vol = portfolio_performance(w, mean_returns, cov_matrix)
+            frontier_ret.append(ret)
+            frontier_vol.append(vol)
+        except Exception:
+            continue
+
+    return frontier_ret, frontier_vol
+
+
+def run_optimizer(include_tickers=None, period="1y", risk_free_rate=0.06, allow_short=False, n_frontier_points=40):
+    """
+    End-to-end optimizer: pulls historical data for the current holdings (or a
+    subset via include_tickers), computes the max-Sharpe and min-volatility
+    portfolios, the efficient frontier, and compares both against your
+    current live weights.
+    """
+    df = load_portfolio()
+
+    if include_tickers:
+        df = df[df["Ticker"].isin(include_tickers)]
+        if len(df) < 2:
+            return None  # need at least 2 assets for a meaningful frontier
+
+    prices = get_historical_prices(df, period=period)
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if len(tickers) < 2:
+        return None
+
+    df = df.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna()
+
+    if prices.empty or len(prices) < 30:
+        return None
+
+    returns = prices.pct_change().dropna()
+    mean_returns = returns.mean() * 252
+    cov_matrix = returns.cov() * 252
+
+    bounds = (-1.0, 1.0) if allow_short else (0.0, 1.0)
+
+    max_sharpe_w = optimize_max_sharpe(mean_returns, cov_matrix, risk_free_rate, bounds)
+    min_vol_w = optimize_min_volatility(mean_returns, cov_matrix, bounds=bounds)
+
+    max_sharpe_ret, max_sharpe_vol = portfolio_performance(max_sharpe_w, mean_returns, cov_matrix)
+    min_vol_ret, min_vol_vol = portfolio_performance(min_vol_w, mean_returns, cov_matrix)
+
+    # Current live weights, for comparison against the optimized portfolios
+    latest_prices = prices.iloc[-1]
+    dollar_values = df["Shares"] * latest_prices
+    current_weights = (dollar_values / dollar_values.sum())
+    current_weights = current_weights.reindex(tickers).values
+    current_ret, current_vol = portfolio_performance(current_weights, mean_returns, cov_matrix)
+
+    frontier_ret, frontier_vol = compute_efficient_frontier(
+        mean_returns, cov_matrix, n_points=n_frontier_points, bounds=bounds
+    )
+
+    return {
+        "tickers": tickers,
+        "mean_returns": mean_returns,
+        "cov_matrix": cov_matrix,
+        "max_sharpe_weights": dict(zip(tickers, max_sharpe_w)),
+        "max_sharpe_return": max_sharpe_ret,
+        "max_sharpe_vol": max_sharpe_vol,
+        "min_vol_weights": dict(zip(tickers, min_vol_w)),
+        "min_vol_return": min_vol_ret,
+        "min_vol_vol": min_vol_vol,
+        "current_weights": dict(zip(tickers, current_weights)),
+        "current_return": current_ret,
+        "current_vol": current_vol,
+        "frontier_returns": frontier_ret,
+        "frontier_vols": frontier_vol,
+        "asset_returns": mean_returns.to_dict(),
+        "asset_vols": {t: float(np.sqrt(cov_matrix.loc[t, t])) for t in tickers}
     }

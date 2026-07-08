@@ -15,8 +15,12 @@ from portfolio import (
     get_drawdown_series,
     get_capture_ratios,
     run_backtest,
-    compute_series_stats
+    compute_series_stats,
+    run_optimizer,
+    get_correlation_matrix,
+    BENCHMARK_OPTIONS
 )
+import datetime
 
 from llm import ask_llm
 
@@ -239,6 +243,28 @@ st.plotly_chart(fig3, use_container_width=True)
 
 
 # ================================
+# CORRELATION MATRIX
+# ================================
+st.subheader("🧬 Holdings Correlation Matrix")
+st.caption("Daily-return correlation over the trailing 1Y. Lower correlations between holdings mean more genuine diversification benefit.")
+
+corr_matrix = get_correlation_matrix(period="1y")
+if corr_matrix is not None:
+    fig_corr = px.imshow(
+        corr_matrix,
+        text_auto=".2f",
+        color_continuous_scale="RdBu_r",
+        zmin=-1, zmax=1,
+        aspect="auto",
+        title="Pairwise Correlation of Daily Returns"
+    )
+    fig_corr.update_layout(coloraxis_colorbar=dict(title="Corr"))
+    st.plotly_chart(fig_corr, use_container_width=True)
+else:
+    st.info("Need at least 2 holdings with overlapping price history to compute a correlation matrix.")
+
+
+# ================================
 # HOLDINGS RANKING
 # ================================
 st.subheader("Holdings Ranking by Weight")
@@ -279,7 +305,9 @@ st.divider()
 # BACKTEST ENGINE
 # ================================
 st.subheader("🔁 Backtest Engine")
-st.caption("Simulates your current holdings/weights over their trailing history: rebalanced vs buy-and-hold.")
+st.caption("Simulates your holdings' trailing history: rebalanced vs buy-and-hold, with configurable filters.")
+
+all_tickers = df["Ticker"].tolist()
 
 bt_col1, bt_col2, bt_col3 = st.columns(3)
 with bt_col1:
@@ -287,73 +315,275 @@ with bt_col1:
 with bt_col2:
     txn_cost = st.slider("Transaction Cost (bps per rebalance)", 0, 50, 10)
 with bt_col3:
-    bt_period = st.selectbox("Lookback Window", ["6mo", "1y", "2y"], index=1)
+    rebalance_mode_label = st.selectbox(
+        "Rebalancing Mode",
+        ["Fixed Target Weights", "Walk-Forward Optimized (Max Sharpe)"],
+        index=0,
+        help="Fixed: always rebalances back to your current live weights. "
+             "Walk-Forward: re-solves for max-Sharpe weights using only trailing data available at each rebalance date."
+    )
+rebalance_mode = "optimized" if "Walk-Forward" in rebalance_mode_label else "fixed"
+
+bt_col4, bt_col5, bt_col6 = st.columns(3)
+with bt_col4:
+    include_tickers = st.multiselect("Include Holdings", all_tickers, default=all_tickers)
+with bt_col5:
+    benchmark_label = st.selectbox("Benchmark Overlay", ["None"] + list(BENCHMARK_OPTIONS.keys()), index=1)
+with bt_col6:
+    bt_rf_rate = st.slider("Risk-Free Rate (%)", 0.0, 12.0, 6.0, step=0.25) / 100.0
+
+date_mode = st.radio("Lookback Window", ["Preset", "Custom Range"], horizontal=True)
+
+bt_period, bt_start, bt_end = "1y", None, None
+if date_mode == "Preset":
+    bt_period = st.select_slider("Preset Window", options=["3mo", "6mo", "1y", "2y", "5y"], value="1y")
+else:
+    date_col1, date_col2 = st.columns(2)
+    default_start = datetime.date.today() - datetime.timedelta(days=365)
+    with date_col1:
+        bt_start = st.date_input("Start Date", value=default_start)
+    with date_col2:
+        bt_end = st.date_input("End Date", value=datetime.date.today())
 
 if st.button("Run Backtest"):
-    with st.spinner("Running backtest simulation..."):
-        bt_result = run_backtest(
-            rebalance_freq=rebalance_freq,
-            transaction_cost_bps=txn_cost,
-            period=bt_period
-        )
-
-    if bt_result is None:
-        st.error("Not enough overlapping historical data across your holdings to run a backtest.")
+    if not include_tickers:
+        st.error("Select at least one holding to include in the backtest.")
     else:
-        rebal_series = bt_result["rebalanced"]
-        bh_series = bt_result["buy_and_hold"]
-
-        fig_bt = go.Figure()
-        fig_bt.add_trace(go.Scatter(
-            x=rebal_series.index, y=rebal_series.values,
-            name=f"Rebalanced ({rebalance_freq})", line=dict(color="#00C897", width=2)
-        ))
-        fig_bt.add_trace(go.Scatter(
-            x=bh_series.index, y=bh_series.values,
-            name="Buy & Hold", line=dict(color="#FFA500", width=2, dash="dash")
-        ))
-        fig_bt.update_layout(
-            title=f"Backtest ({bt_period}): Rebalanced vs Buy & Hold — Growth of ₹1",
-            xaxis_title="Date",
-            yaxis_title="Growth of ₹1",
-            hovermode="x unified"
-        )
-        st.plotly_chart(fig_bt, use_container_width=True)
-
-        stats_rebal = compute_series_stats(rebal_series)
-        stats_bh = compute_series_stats(bh_series)
-
-        stats_df = pd.DataFrame({
-            "Rebalanced": stats_rebal,
-            "Buy & Hold": stats_bh
-        }).T
-        stats_df = stats_df.rename(columns={
-            "cagr": "CAGR",
-            "volatility": "Volatility",
-            "sharpe": "Sharpe",
-            "max_drawdown": "Max Drawdown"
-        })
-        stats_df["CAGR"] = stats_df["CAGR"].map(lambda x: f"{x:.2%}")
-        stats_df["Volatility"] = stats_df["Volatility"].map(lambda x: f"{x:.2%}")
-        stats_df["Sharpe"] = stats_df["Sharpe"].map(lambda x: f"{x:.2f}")
-        stats_df["Max Drawdown"] = stats_df["Max Drawdown"].map(lambda x: f"{x:.2%}")
-
-        st.dataframe(stats_df, use_container_width=True)
-
-        if rebalance_freq != "None":
-            st.caption(
-                f"Cumulative transaction-cost drag from rebalancing: "
-                f"{bt_result['total_transaction_cost']:.4%} of portfolio value over the window."
+        with st.spinner("Running backtest simulation..."):
+            benchmark_ticker = BENCHMARK_OPTIONS.get(benchmark_label) if benchmark_label != "None" else None
+            bt_result = run_backtest(
+                rebalance_freq=rebalance_freq,
+                transaction_cost_bps=txn_cost,
+                period=bt_period,
+                start=bt_start,
+                end=bt_end,
+                include_tickers=include_tickers,
+                benchmark_ticker=benchmark_ticker,
+                risk_free_rate=bt_rf_rate,
+                rebalance_mode=rebalance_mode
             )
 
-        with st.expander("ℹ️ How this backtest works"):
-            st.markdown("""
-            - **Target weights** come from your current holdings (shares × latest price).
-            - **Buy & Hold** starts at those weights and lets them drift naturally with price moves — no trading.
-            - **Rebalanced** periodically sells winners / buys laggards back to the target weights,
-              paying a simple proportional transaction cost (in bps) on the turnover at each rebalance.
-            - This is a simplified simulation: it ignores dividends, taxes, and intraday slippage.
-            """)
+        if bt_result is None:
+            st.error("Not enough overlapping historical data for the selected holdings/date range to run a backtest.")
+        else:
+            rebal_series = bt_result["rebalanced"]
+            bh_series = bt_result["buy_and_hold"]
+
+            fig_bt = go.Figure()
+            fig_bt.add_trace(go.Scatter(
+                x=rebal_series.index, y=rebal_series.values,
+                name=f"Rebalanced ({rebalance_freq})", line=dict(color="#00C897", width=2)
+            ))
+            fig_bt.add_trace(go.Scatter(
+                x=bh_series.index, y=bh_series.values,
+                name="Buy & Hold", line=dict(color="#FFA500", width=2, dash="dash")
+            ))
+            if "benchmark" in bt_result:
+                fig_bt.add_trace(go.Scatter(
+                    x=bt_result["benchmark"].index, y=bt_result["benchmark"].values,
+                    name=benchmark_label, line=dict(color="#888888", width=1.5, dash="dot")
+                ))
+            fig_bt.update_layout(
+                title="Backtest: Rebalanced vs Buy & Hold — Growth of ₹1",
+                xaxis_title="Date",
+                yaxis_title="Growth of ₹1",
+                hovermode="x unified"
+            )
+            st.plotly_chart(fig_bt, use_container_width=True)
+
+            stats_data = {
+                "Rebalanced": compute_series_stats(rebal_series, risk_free_rate=bt_rf_rate),
+                "Buy & Hold": compute_series_stats(bh_series, risk_free_rate=bt_rf_rate)
+            }
+            if "benchmark" in bt_result:
+                stats_data[benchmark_label] = compute_series_stats(bt_result["benchmark"], risk_free_rate=bt_rf_rate)
+
+            stats_df = pd.DataFrame(stats_data).T
+            stats_df = stats_df.rename(columns={
+                "cagr": "CAGR", "volatility": "Volatility", "sharpe": "Sharpe", "max_drawdown": "Max Drawdown"
+            })
+            stats_df["CAGR"] = stats_df["CAGR"].map(lambda x: f"{x:.2%}")
+            stats_df["Volatility"] = stats_df["Volatility"].map(lambda x: f"{x:.2%}")
+            stats_df["Sharpe"] = stats_df["Sharpe"].map(lambda x: f"{x:.2f}")
+            stats_df["Max Drawdown"] = stats_df["Max Drawdown"].map(lambda x: f"{x:.2%}")
+
+            st.dataframe(stats_df, use_container_width=True)
+
+            if rebalance_freq != "None":
+                st.caption(
+                    f"Cumulative transaction-cost drag from rebalancing: "
+                    f"{bt_result['total_transaction_cost']:.4%} of portfolio value over the window."
+                )
+
+            with st.expander("ℹ️ How this backtest works"):
+                st.markdown("""
+                - **Fixed mode:** target weights come from your current holdings (shares × latest price);
+                  rebalancing pulls drifted weights back to those targets.
+                - **Walk-Forward Optimized mode:** at each rebalance date, weights are re-solved for
+                  max Sharpe ratio using only the trailing lookback window available up to that date
+                  (no future data is used) — this approximates how a systematic strategy would actually
+                  be run in real time.
+                - **Buy & Hold** always starts at your live target weights and never trades.
+                - Transaction costs are a simple proportional charge (in bps) on turnover at each rebalance.
+                - This is a simplified simulation: it ignores dividends, taxes, and intraday slippage.
+                """)
+
+st.divider()
+
+
+# ================================
+# MEAN-VARIANCE OPTIMIZER / EFFICIENT FRONTIER
+# ================================
+st.subheader("🎯 Portfolio Optimizer — Efficient Frontier")
+st.caption("Classic Markowitz mean-variance optimization: compares your current weights against the max-Sharpe and min-volatility portfolios.")
+
+opt_col1, opt_col2, opt_col3 = st.columns(3)
+with opt_col1:
+    opt_tickers = st.multiselect("Assets to Optimize Over", all_tickers, default=all_tickers, key="opt_tickers")
+with opt_col2:
+    opt_period = st.selectbox("Historical Window", ["6mo", "1y", "2y", "5y"], index=1, key="opt_period")
+with opt_col3:
+    opt_rf_rate = st.slider("Risk-Free Rate (%) ", 0.0, 12.0, 6.0, step=0.25, key="opt_rf") / 100.0
+
+allow_short = st.checkbox("Allow short-selling (negative weights)", value=False)
+
+if st.button("Run Optimizer"):
+    if len(opt_tickers) < 2:
+        st.error("Select at least 2 assets to build a meaningful efficient frontier.")
+    else:
+        with st.spinner("Solving for optimal portfolios..."):
+            opt_result = run_optimizer(
+                include_tickers=opt_tickers,
+                period=opt_period,
+                risk_free_rate=opt_rf_rate,
+                allow_short=allow_short
+            )
+
+        if opt_result is None:
+            st.error("Not enough overlapping historical data for the selected assets to run the optimizer.")
+        else:
+            fig_frontier = go.Figure()
+
+            # Efficient frontier curve
+            fig_frontier.add_trace(go.Scatter(
+                x=[v * 100 for v in opt_result["frontier_vols"]],
+                y=[r * 100 for r in opt_result["frontier_returns"]],
+                mode="lines", name="Efficient Frontier",
+                line=dict(color="#6C63FF", width=2)
+            ))
+
+            # Individual assets
+            asset_x = [opt_result["asset_vols"][t] * 100 for t in opt_result["tickers"]]
+            asset_y = [opt_result["asset_returns"][t] * 100 for t in opt_result["tickers"]]
+            fig_frontier.add_trace(go.Scatter(
+                x=asset_x, y=asset_y, mode="markers+text", name="Individual Holdings",
+                text=opt_result["tickers"], textposition="top center",
+                marker=dict(size=9, color="#AAAAAA")
+            ))
+
+            # Current portfolio
+            fig_frontier.add_trace(go.Scatter(
+                x=[opt_result["current_vol"] * 100], y=[opt_result["current_return"] * 100],
+                mode="markers", name="Your Current Portfolio",
+                marker=dict(size=14, color="#FF6B6B", symbol="diamond")
+            ))
+
+            # Max Sharpe portfolio
+            fig_frontier.add_trace(go.Scatter(
+                x=[opt_result["max_sharpe_vol"] * 100], y=[opt_result["max_sharpe_return"] * 100],
+                mode="markers", name="Max Sharpe Portfolio",
+                marker=dict(size=14, color="#00C897", symbol="star")
+            ))
+
+            # Min volatility portfolio
+            fig_frontier.add_trace(go.Scatter(
+                x=[opt_result["min_vol_vol"] * 100], y=[opt_result["min_vol_return"] * 100],
+                mode="markers", name="Min Volatility Portfolio",
+                marker=dict(size=14, color="#FFA500", symbol="square")
+            ))
+
+            fig_frontier.update_layout(
+                title="Efficient Frontier — Risk vs Return",
+                xaxis_title="Annualised Volatility (%)",
+                yaxis_title="Annualised Return (%)",
+                hovermode="closest"
+            )
+            st.plotly_chart(fig_frontier, use_container_width=True)
+
+            # Weight comparison table
+            weight_rows = []
+            for t in opt_result["tickers"]:
+                weight_rows.append({
+                    "Ticker": t,
+                    "Current Weight": opt_result["current_weights"][t],
+                    "Max Sharpe Weight": opt_result["max_sharpe_weights"][t],
+                    "Min Volatility Weight": opt_result["min_vol_weights"][t]
+                })
+            weight_df = pd.DataFrame(weight_rows).set_index("Ticker")
+            # Series.map (not DataFrame.applymap/.map, which vary across pandas versions) for safety
+            weight_df_display = weight_df.apply(lambda col: col.map(lambda x: f"{x:.2%}"))
+            st.dataframe(weight_df_display, use_container_width=True)
+
+            # --- Suggested rebalancing trades: turn the abstract weights into concrete actions ---
+            st.markdown("#### 💡 Suggested Rebalancing Trades")
+            target_choice = st.radio(
+                "Target Allocation", ["Max Sharpe Portfolio", "Min Volatility Portfolio"],
+                horizontal=True, key="opt_target_choice"
+            )
+            target_weights_map = (
+                opt_result["max_sharpe_weights"] if target_choice == "Max Sharpe Portfolio"
+                else opt_result["min_vol_weights"]
+            )
+
+            subset_df = df[df["Ticker"].isin(opt_result["tickers"])].set_index("Ticker")
+            subset_value = subset_df["Value"].sum()
+
+            trade_rows = []
+            for t in opt_result["tickers"]:
+                if t not in subset_df.index or pd.isna(subset_df.loc[t, "CurrentPrice"]):
+                    continue
+                price = subset_df.loc[t, "CurrentPrice"]
+                current_shares = subset_df.loc[t, "Shares"]
+                target_value = target_weights_map[t] * subset_value
+                target_shares = target_value / price
+                delta_shares = target_shares - current_shares
+
+                trade_rows.append({
+                    "Ticker": t,
+                    "Current Shares": round(current_shares, 1),
+                    "Target Shares": round(target_shares, 1),
+                    "Action": "Buy" if delta_shares > 0.05 else ("Sell" if delta_shares < -0.05 else "Hold"),
+                    "Shares to Trade": round(abs(delta_shares), 1),
+                    "Approx ₹ Value": f"₹{abs(delta_shares * price):,.0f}"
+                })
+
+            if trade_rows:
+                trade_df = pd.DataFrame(trade_rows).set_index("Ticker")
+                st.dataframe(trade_df, use_container_width=True)
+                st.caption(
+                    "Share counts are implied by target weights and may include fractions — round to your "
+                    "broker's tradable lot size. This ignores brokerage, taxes, and market impact."
+                )
+
+            summary_col1, summary_col2, summary_col3 = st.columns(3)
+            summary_col1.metric("Current Portfolio", f"{opt_result['current_return']:.2%} return",
+                                 f"{opt_result['current_vol']:.2%} volatility")
+            summary_col2.metric("Max Sharpe Portfolio", f"{opt_result['max_sharpe_return']:.2%} return",
+                                 f"{opt_result['max_sharpe_vol']:.2%} volatility")
+            summary_col3.metric("Min Volatility Portfolio", f"{opt_result['min_vol_return']:.2%} return",
+                                 f"{opt_result['min_vol_vol']:.2%} volatility")
+
+            with st.expander("ℹ️ How to read this"):
+                st.markdown("""
+                - Each point on the **purple curve** is the lowest possible volatility achievable for that level of return,
+                  given your selected assets' historical means, variances, and correlations.
+                - The **red diamond** is where your current holdings actually sit — often *inside* the frontier,
+                  meaning the same or better return is achievable at lower risk with different weights.
+                - The **green star** is the max-Sharpe (best risk-adjusted return) portfolio; the **orange square**
+                  is the lowest-volatility portfolio achievable from these assets.
+                - This is based purely on **trailing historical data** — it assumes the past return/risk/correlation
+                  pattern continues, which is a real limitation of mean-variance optimization in practice.
+                """)
 
 st.divider()
 
