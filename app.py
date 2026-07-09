@@ -29,6 +29,10 @@ from portfolio import (
     run_monte_carlo_var,
     get_liquidity_metrics,
     get_factor_decomposition,
+    get_sector_attribution,
+    simulate_add_holding,
+    build_excel_report,
+    build_pdf_report,
     BENCHMARK_OPTIONS
 )
 
@@ -140,12 +144,48 @@ with st.container(border=True):
 
 st.write("")
 
+# ================================
+# SIDEBAR — REPORT EXPORT (global action, not tab-specific)
+# ================================
+st.sidebar.markdown("---")
+st.sidebar.subheader("📄 Export Report")
+
+try:
+    excel_bytes = build_excel_report({
+        "Holdings": df,
+        "Key Metrics": pd.DataFrame({
+            "Metric": ["Portfolio Value", "Annual Return", "Sharpe Ratio", "Beta", "Max Drawdown",
+                       "Volatility (Ann.)", "Upside Capture %", "Downside Capture %"],
+            "Value": [total_value, metrics["annual_return"], metrics["sharpe"], metrics["beta"],
+                      metrics["max_drawdown"], metrics["volatility"],
+                      capture["upside_capture"], capture["downside_capture"]]
+        })
+    })
+    st.sidebar.download_button(
+        "⬇️ Download Excel Report", data=excel_bytes,
+        file_name=f"portfolio_report_{datetime.date.today()}.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+except Exception as e:
+    st.sidebar.caption(f"Excel export unavailable: {e}")
+
+try:
+    pdf_bytes = build_pdf_report(df, metrics, capture, total_value)
+    st.sidebar.download_button(
+        "⬇️ Download PDF Summary", data=pdf_bytes,
+        file_name=f"portfolio_summary_{datetime.date.today()}.pdf",
+        mime="application/pdf"
+    )
+except Exception as e:
+    st.sidebar.caption(f"PDF export unavailable: {e}")
+
 
 # ================================
 # TABS
 # ================================
-tab_overview, tab_risk, tab_advrisk, tab_backtest, tab_optimizer, tab_ai = st.tabs([
-    "📊 Overview", "⚠️ Risk Analytics", "🧮 Advanced Risk", "🔁 Backtesting", "🎯 Optimizer", "🤖 AI Insights"
+tab_overview, tab_risk, tab_advrisk, tab_whatif, tab_backtest, tab_optimizer, tab_ai = st.tabs([
+    "📊 Overview", "⚠️ Risk Analytics", "🧮 Advanced Risk", "🧪 What-If & Attribution",
+    "🔁 Backtesting", "🎯 Optimizer", "🤖 AI Insights"
 ])
 
 
@@ -661,6 +701,140 @@ with tab_advrisk:
 
 # ============================================================
 # TAB 4 — BACKTESTING
+# ============================================================
+# ============================================================
+# TAB 4 — WHAT-IF & ATTRIBUTION
+# ============================================================
+with tab_whatif:
+
+    # --- Sector Contribution & Allocation Tilt ---
+    st.subheader("📐 Sector Contribution & Allocation Tilt")
+    st.caption("Where your actual return came from, sector by sector.")
+
+    st.info(
+        "ℹ️ This is a **simplified sector view, not full Brinson-Fachler attribution**. "
+        "'Contribution to Portfolio Return' is exact, computed from your real holdings. "
+        "'Approx. Benchmark Weight' uses illustrative NIFTY 50 sector weights (not live data) — "
+        "true institutional attribution would need actual benchmark sector-level returns, which "
+        "aren't available through this pipeline.",
+        icon="ℹ️"
+    )
+
+    attr_period = st.selectbox("Attribution Window", ["3mo", "6mo", "1y", "2y"], index=2, key="attr_period")
+    attr_result = get_sector_attribution(period=attr_period)
+
+    if attr_result is None:
+        st.info("Not enough historical data to compute sector attribution for this window.")
+    else:
+        acol1, acol2, acol3 = st.columns(3)
+        acol1.metric("Portfolio Return (Window)", f"{attr_result['total_portfolio_return']:.2%}")
+        acol2.metric("Benchmark Return (Window)", f"{attr_result['total_benchmark_return']:.2%}")
+        acol3.metric("Excess Return", f"{attr_result['excess_return']:.2%}")
+
+        fig_attr = go.Figure()
+        contrib = attr_result["attribution"]["Contribution to Portfolio Return"]
+        fig_attr.add_trace(go.Bar(
+            x=contrib.index, y=contrib.values * 100,
+            marker_color=["#00C897" if v >= 0 else "#FF6B6B" for v in contrib.values],
+            text=[f"{v:.1%}" for v in contrib.values], textposition="outside"
+        ))
+        fig_attr.update_layout(
+            title="Contribution to Portfolio Return by Sector",
+            yaxis_title="Contribution (%)", xaxis_title=""
+        )
+        st.plotly_chart(fig_attr, use_container_width=True)
+
+        attr_display = attr_result["attribution"].copy()
+        for col in ["Portfolio Weight", "Approx. Benchmark Weight", "Weight Tilt",
+                    "Sector Return (Your Holdings)", "Contribution to Portfolio Return"]:
+            attr_display[col] = attr_display[col].map(lambda x: f"{x:.2%}")
+        st.dataframe(attr_display, use_container_width=True)
+
+        with st.expander("ℹ️ How to read this"):
+            st.markdown("""
+            - **Contribution to Portfolio Return** is exact and sums precisely to your total portfolio
+              return over the window — no approximation involved.
+            - **Weight Tilt** shows where you're over/underweight vs. the illustrative benchmark sector
+              weights — positive means overweight that sector relative to NIFTY 50's approximate composition.
+            - This intentionally stops short of calling itself "Allocation Effect" / "Selection Effect" in the
+              formal Brinson-Fachler sense, since that requires real sector-level benchmark returns this
+              pipeline doesn't have access to. Treat it as a directional diagnostic, not an institutional-grade
+              attribution report.
+            """)
+
+    st.divider()
+
+    # --- What-If New Holding Simulator ---
+    st.subheader("🧪 What-If: Add a New Holding")
+    st.caption("Test how a hypothetical position would change your portfolio's risk/return — without actually buying anything.")
+
+    wi_col1, wi_col2, wi_col3 = st.columns(3)
+    with wi_col1:
+        wi_ticker = st.text_input("Ticker (NSE format, e.g. WIPRO.NS)", value="")
+    with wi_col2:
+        wi_shares = st.number_input("Shares to Add", min_value=1, value=10, step=1)
+    with wi_col3:
+        wi_period = st.selectbox("Historical Window", ["6mo", "1y", "2y"], index=1, key="wi_period")
+
+    if st.button("Simulate Adding This Holding"):
+        if not wi_ticker.strip():
+            st.error("Enter a ticker symbol first.")
+        else:
+            with st.spinner(f"Simulating portfolio with {wi_ticker.strip().upper()} added..."):
+                wi_result = simulate_add_holding(
+                    new_ticker=wi_ticker.strip().upper(), new_shares=wi_shares, period=wi_period
+                )
+
+            if wi_result is None:
+                st.error(
+                    f"Couldn't fetch enough historical data for '{wi_ticker.strip().upper()}'. "
+                    "Check the ticker is correct (NSE tickers end in .NS)."
+                )
+            else:
+                st.markdown(f"#### Before vs. After Adding {wi_result['new_ticker']}")
+
+                comp_col1, comp_col2 = st.columns(2)
+                with comp_col1:
+                    st.markdown("**Current Portfolio**")
+                    st.metric("Annual Return", f"{wi_result['current_annual_return']:.2%}")
+                    st.metric("Volatility", f"{wi_result['current_volatility']:.2%}")
+                    st.metric("Beta", f"{wi_result['current_beta']:.2f}")
+                    st.metric("Sharpe", f"{wi_result['current_sharpe']:.2f}")
+                with comp_col2:
+                    st.markdown(f"**With {wi_result['new_ticker']} Added**")
+                    st.metric("Annual Return", f"{wi_result['new_annual_return']:.2%}",
+                               f"{wi_result['new_annual_return'] - wi_result['current_annual_return']:+.2%}")
+                    st.metric("Volatility", f"{wi_result['new_volatility']:.2%}",
+                               f"{wi_result['new_volatility'] - wi_result['current_volatility']:+.2%}",
+                               delta_color="inverse")
+                    st.metric("Beta", f"{wi_result['new_beta']:.2f}",
+                               f"{wi_result['new_beta'] - wi_result['current_beta']:+.2f}")
+                    st.metric("Sharpe", f"{wi_result['new_sharpe']:.2f}",
+                               f"{wi_result['new_sharpe'] - wi_result['current_sharpe']:+.2f}")
+
+                corr_val = wi_result["correlation_with_current_portfolio"]
+                if pd.notna(corr_val):
+                    fit_label = (
+                        "Strong diversifier (low/negative correlation)" if corr_val < 0.3 else
+                        "Moderate diversification benefit" if corr_val < 0.7 else
+                        "Low diversification benefit (moves closely with your existing portfolio)"
+                    )
+                    st.metric("Correlation with Current Portfolio", f"{corr_val:.2f}", fit_label)
+
+                with st.expander("ℹ️ How to read this"):
+                    st.markdown("""
+                    - This recomputes portfolio-level return, volatility, beta, and Sharpe **as if** the new
+                      position were added at its current price and held over the same historical window —
+                      your saved portfolio (`data/portfolio.csv`) is not modified.
+                    - **Correlation with Current Portfolio** below ~0.3 suggests genuine diversification benefit;
+                      above ~0.7 suggests the new holding largely duplicates risk you already have.
+                    - This uses trailing historical data only — it says nothing about the new holding's
+                      valuation, fundamentals, or forward-looking prospects.
+                    """)
+
+
+# ============================================================
+# TAB 5 — BACKTESTING
 # ============================================================
 with tab_backtest:
     st.subheader("🔁 Backtest Engine")

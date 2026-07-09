@@ -1,6 +1,8 @@
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import datetime
+import io
 from scipy.optimize import minimize
 from scipy.stats import norm, skew, kurtosis
 
@@ -1097,3 +1099,235 @@ def get_factor_decomposition(period="1y"):
     }
 
     return {"portfolio": portfolio_level, "assets": asset_df}
+
+
+# ================================
+# SECTOR CONTRIBUTION & ALLOCATION TILT
+# NOTE: This is NOT full Brinson-Fachler attribution. True Brinson requires
+# benchmark SECTOR-LEVEL returns (what NIFTY 50 did within Banking, IT, etc.
+# specifically), which isn't available through this pipeline. Instead:
+#   - "Contribution to Portfolio Return" is EXACT — wp_i x actual sector
+#     return, computed from your real holdings. These sum precisely to your
+#     total portfolio return over the window.
+#   - "Approx. Benchmark Weight" and "Weight Tilt" use ILLUSTRATIVE NIFTY 50
+#     sector weights (a reasonable approximation of typical index
+#     composition) — refresh DEFAULT_BENCHMARK_SECTOR_WEIGHTS from the
+#     latest NSE factsheet for precision.
+# ================================
+DEFAULT_BENCHMARK_SECTOR_WEIGHTS = {
+    "Banking": 0.35,
+    "IT": 0.13,
+    "Energy": 0.10,
+    "FMCG": 0.08,
+    "Other": 0.34,   # residual bucket: autos, pharma, metals, telecom, construction, power, etc.
+    "ETF": 0.0,
+    "Gold": 0.0
+}
+
+
+def get_sector_attribution(period="1y", benchmark_sector_weights=None):
+    if benchmark_sector_weights is None:
+        benchmark_sector_weights = DEFAULT_BENCHMARK_SECTOR_WEIGHTS
+
+    df = load_portfolio()
+    prices = get_historical_prices(df, period=period)
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if not tickers:
+        return None
+
+    df = df.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna()
+    if prices.empty or len(prices) < 2:
+        return None
+
+    sector_map = get_sector_map()
+    df["Sector"] = [sector_map.get(t, "Other") for t in df.index]
+
+    first_prices = prices.iloc[0]
+    last_prices = prices.iloc[-1]
+    stock_total_return = (last_prices - first_prices) / first_prices
+
+    dollar_values = df["Shares"] * last_prices
+    port_weights = dollar_values / dollar_values.sum()
+
+    bench = get_benchmark_history("^NSEI", period=period)
+    bench_aligned = bench.reindex(prices.index).dropna()
+    if len(bench_aligned) < 2:
+        return None
+    bench_total_return = float((bench_aligned.iloc[-1] - bench_aligned.iloc[0]) / bench_aligned.iloc[0])
+
+    sector_agg = {}
+    for t in tickers:
+        sec = df.loc[t, "Sector"]
+        w = float(port_weights[t])
+        r = float(stock_total_return[t])
+        if sec not in sector_agg:
+            sector_agg[sec] = {"weight": 0.0, "contribution": 0.0}
+        sector_agg[sec]["weight"] += w
+        sector_agg[sec]["contribution"] += w * r
+
+    rows = []
+    for sec, vals in sector_agg.items():
+        wp = vals["weight"]
+        sector_return = vals["contribution"] / wp if wp > 0 else 0.0
+        wb = benchmark_sector_weights.get(sec, 0.0)
+        rows.append({
+            "Sector": sec,
+            "Portfolio Weight": wp,
+            "Approx. Benchmark Weight": wb,
+            "Weight Tilt": wp - wb,
+            "Sector Return (Your Holdings)": sector_return,
+            "Contribution to Portfolio Return": vals["contribution"]
+        })
+
+    attribution_df = pd.DataFrame(rows).set_index("Sector")
+    total_portfolio_return = float(attribution_df["Contribution to Portfolio Return"].sum())
+
+    return {
+        "attribution": attribution_df,
+        "total_portfolio_return": total_portfolio_return,
+        "total_benchmark_return": bench_total_return,
+        "excess_return": total_portfolio_return - bench_total_return
+    }
+
+
+# ================================
+# WHAT-IF NEW HOLDING SIMULATOR
+# Simulates adding a hypothetical position to your CURRENT holdings and
+# recomputes portfolio-level return, volatility, beta, and Sharpe — without
+# actually modifying your saved portfolio. Also reports the new ticker's
+# correlation with your existing (pre-addition) portfolio, as a quick
+# "diversification fit" signal.
+# ================================
+def simulate_add_holding(new_ticker, new_shares, period="1y", risk_free_rate=0.06):
+    df = load_portfolio()
+    new_row = pd.DataFrame({"Ticker": [new_ticker], "Shares": [new_shares]})
+    combined = pd.concat([df, new_row], ignore_index=True)
+
+    prices = get_historical_prices(combined, period=period)
+    if prices.empty or new_ticker not in prices.columns:
+        return None
+
+    tickers = [t for t in combined["Ticker"].tolist() if t in prices.columns]
+    combined = combined.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna()
+    if prices.empty or len(prices) < 30:
+        return None
+
+    returns = prices.pct_change().dropna()
+    latest_prices = prices.iloc[-1]
+    dollar_values = combined["Shares"] * latest_prices
+    new_weights = dollar_values / dollar_values.sum()
+
+    new_portfolio_returns = (returns[tickers] * new_weights[tickers]).sum(axis=1)
+
+    bench = get_benchmark_history("^NSEI", period=period)
+    bench_returns = bench.pct_change().dropna()
+    aligned = pd.concat([new_portfolio_returns, bench_returns], axis=1).dropna()
+    if aligned.empty:
+        return None
+    aligned.columns = ["p", "b"]
+
+    new_annual_return = float(aligned["p"].mean() * 252)
+    new_vol = float(aligned["p"].std() * np.sqrt(252))
+    new_beta = float(aligned["p"].cov(aligned["b"]) / (aligned["b"].var() + 1e-9))
+    new_sharpe = (new_annual_return - risk_free_rate) / (new_vol + 1e-9)
+
+    current_metrics = get_metrics()
+
+    corr_with_current = np.nan
+    if new_ticker in returns.columns:
+        new_ticker_returns = returns[new_ticker]
+        current_port_returns = current_metrics.get("returns", pd.Series(dtype=float))
+        corr_aligned = pd.concat([new_ticker_returns, current_port_returns], axis=1).dropna()
+        if len(corr_aligned) > 2:
+            corr_with_current = float(corr_aligned.iloc[:, 0].corr(corr_aligned.iloc[:, 1]))
+
+    return {
+        "new_ticker": new_ticker,
+        "new_weights": new_weights.to_dict(),
+        "new_annual_return": new_annual_return,
+        "new_volatility": new_vol,
+        "new_beta": new_beta,
+        "new_sharpe": new_sharpe,
+        "current_annual_return": current_metrics["annual_return"],
+        "current_volatility": current_metrics["volatility"],
+        "current_beta": current_metrics["beta"],
+        "current_sharpe": current_metrics["sharpe"],
+        "correlation_with_current_portfolio": corr_with_current
+    }
+
+
+# ================================
+# REPORT EXPORT — Excel & PDF
+# Generic builders: pass in whatever DataFrames/metrics you want included.
+# Both return raw bytes, ready for st.download_button.
+# ================================
+def build_excel_report(sheets):
+    """sheets: dict of {sheet_name: DataFrame}. Sheet names are truncated to
+    Excel's 31-character limit."""
+    buffer = io.BytesIO()
+    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+        for name, sheet_df in sheets.items():
+            safe_name = str(name)[:31]
+            sheet_df.to_excel(writer, sheet_name=safe_name)
+    return buffer.getvalue()
+
+
+def build_pdf_report(holdings_df, metrics, capture, total_value):
+    from reportlab.lib.pagesizes import A4
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.lib.styles import getSampleStyleSheet
+    from reportlab.lib import colors
+
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4)
+    styles = getSampleStyleSheet()
+    elements = []
+
+    elements.append(Paragraph("Portfolio Intelligence Report", styles["Title"]))
+    elements.append(Paragraph(
+        f"Generated: {datetime.datetime.now().strftime('%d %b %Y, %I:%M %p')}", styles["Normal"]
+    ))
+    elements.append(Spacer(1, 14))
+
+    elements.append(Paragraph("Key Metrics", styles["Heading2"]))
+    metrics_data = [
+        ["Metric", "Value"],
+        ["Portfolio Value", f"Rs. {total_value:,.0f}"],
+        ["Annual Return", f"{metrics['annual_return']:.2%}"],
+        ["Sharpe Ratio", f"{metrics['sharpe']:.2f}"],
+        ["Beta", f"{metrics['beta']:.2f}"],
+        ["Max Drawdown", f"{metrics['max_drawdown']:.2%}"],
+        ["Volatility (Ann.)", f"{metrics['volatility']:.2%}"],
+        ["Upside Capture", f"{capture['upside_capture']:.1f}%"],
+        ["Downside Capture", f"{capture['downside_capture']:.1f}%"]
+    ]
+    metrics_table = Table(metrics_data, hAlign="LEFT")
+    metrics_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#00C897")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("BOTTOMPADDING", (0, 0), (-1, 0), 6),
+    ]))
+    elements.append(metrics_table)
+    elements.append(Spacer(1, 16))
+
+    elements.append(Paragraph("Holdings", styles["Heading2"]))
+    holdings_str = holdings_df.astype(str)
+    holdings_data = [list(holdings_str.columns)] + holdings_str.values.tolist()
+    holdings_table = Table(holdings_data, hAlign="LEFT")
+    holdings_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#333333")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+        ("FONTSIZE", (0, 0), (-1, -1), 8),
+    ]))
+    elements.append(holdings_table)
+
+    doc.build(elements)
+    return buffer.getvalue()
