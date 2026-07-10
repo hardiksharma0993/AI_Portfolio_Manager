@@ -1331,3 +1331,419 @@ def build_pdf_report(holdings_df, metrics, capture, total_value):
 
     doc.build(elements)
     return buffer.getvalue()
+
+
+# ================================
+# BLACK-LITTERMAN MODEL
+# Bayesian portfolio optimization (Black & Litterman, 1990). Standard
+# mean-variance optimization is notoriously unstable — small changes in
+# expected-return inputs produce wildly different "optimal" weights. Black-
+# Litterman fixes this by starting from MARKET-IMPLIED equilibrium returns
+# (derived mathematically from market weights + covariance, not guessed),
+# then blends in your own views with an explicit confidence level.
+#
+#   Pi (equilibrium returns) = delta * Sigma * w_market
+#   Combined returns = [(tau*Sigma)^-1 + P'Omega^-1 P]^-1
+#                       * [(tau*Sigma)^-1 * Pi + P'Omega^-1 * Q]
+#
+# where P/Q encode your views ("I think TCS.NS will return 15%") and Omega
+# encodes how confident you are in each view (via the He-Litterman scaling:
+# Omega_kk = (P_k Sigma P_k') * tau / confidence_k).
+# ================================
+def black_litterman_returns(cov_matrix, market_weights, delta, views, tau=0.025):
+    """
+    cov_matrix: pd.DataFrame (N x N annualised covariance)
+    market_weights: pd.Series of market/equilibrium weights, same tickers
+    delta: risk-aversion coefficient (scalar)
+    views: list of dicts: [{"ticker": "TCS.NS", "expected_return": 0.15, "confidence": 0.5}, ...]
+            confidence in (0, 1]; higher = more confident = view weighted more heavily
+    Returns: (combined_returns: pd.Series, prior_equilibrium_returns: pd.Series)
+    """
+    tickers = cov_matrix.index.tolist()
+    n = len(tickers)
+    Sigma = cov_matrix.values
+
+    w_mkt = market_weights.reindex(tickers).fillna(0.0).values
+    if w_mkt.sum() <= 0:
+        w_mkt = np.repeat(1.0 / n, n)
+    else:
+        w_mkt = w_mkt / w_mkt.sum()
+
+    Pi = delta * (Sigma @ w_mkt)
+    prior_series = pd.Series(Pi, index=tickers)
+
+    valid_views = [v for v in views if v.get("ticker") in tickers]
+    if not valid_views:
+        return prior_series.copy(), prior_series.copy()
+
+    K = len(valid_views)
+    P = np.zeros((K, n))
+    Q = np.zeros(K)
+    confidences = np.zeros(K)
+
+    for i, v in enumerate(valid_views):
+        j = tickers.index(v["ticker"])
+        P[i, j] = 1.0
+        Q[i] = v["expected_return"]
+        confidences[i] = min(max(v.get("confidence", 0.5), 1e-4), 1 - 1e-6)
+
+    tau_Sigma = tau * Sigma
+    # Omega scales by (1-confidence)/confidence so that confidence -> 1 drives
+    # uncertainty -> 0 (full trust in the view) and confidence -> 0 drives
+    # uncertainty -> infinity (view essentially ignored) — both required
+    # asymptotic properties of a sensible confidence mapping.
+    omega_diag = np.array([
+        (P[i:i + 1] @ tau_Sigma @ P[i:i + 1].T).item() * (1 - confidences[i]) / confidences[i]
+        for i in range(K)
+    ])
+    omega_diag = np.maximum(omega_diag, 1e-12)
+    Omega = np.diag(omega_diag)
+
+    tau_Sigma_inv = np.linalg.inv(tau_Sigma)
+    Omega_inv = np.linalg.inv(Omega)
+
+    M_inv = tau_Sigma_inv + P.T @ Omega_inv @ P
+    M = np.linalg.inv(M_inv)
+    combined = M @ (tau_Sigma_inv @ Pi + P.T @ Omega_inv @ Q)
+
+    return pd.Series(combined, index=tickers), prior_series
+
+
+def run_black_litterman(include_tickers=None, period="1y", views=None, tau=0.025,
+                         risk_free_rate=0.06, use_market_cap=True, allow_short=False):
+    df = load_portfolio()
+    if include_tickers:
+        df = df[df["Ticker"].isin(include_tickers)]
+        if len(df) < 2:
+            return None
+
+    prices = get_historical_prices(df, period=period)
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if len(tickers) < 2:
+        return None
+
+    df = df.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna()
+    if prices.empty or len(prices) < 30:
+        return None
+
+    returns = prices.pct_change().dropna()
+    cov_matrix = returns.cov() * 252
+
+    market_cap_source = "current portfolio weights (fallback proxy)"
+    market_weights = None
+
+    if use_market_cap:
+        caps = {}
+        for t in tickers:
+            try:
+                info = yf.Ticker(t).info
+                mc = info.get("marketCap")
+                if mc and mc > 0:
+                    caps[t] = mc
+            except Exception:
+                pass
+        if len(caps) == len(tickers):
+            market_weights = pd.Series(caps)
+            market_cap_source = "live market capitalization"
+
+    if market_weights is None:
+        latest_prices = prices.iloc[-1]
+        dollar_values = df["Shares"] * latest_prices
+        market_weights = dollar_values / dollar_values.sum()
+
+    bench = get_benchmark_history("^NSEI", period=period)
+    bench_returns = bench.pct_change().dropna()
+    bench_annual_return = float(bench_returns.mean() * 252)
+    bench_annual_var = float(bench_returns.var() * 252)
+    delta = (bench_annual_return - risk_free_rate) / (bench_annual_var + 1e-9)
+
+    combined_returns, prior_returns = black_litterman_returns(
+        cov_matrix, market_weights, delta, views or [], tau=tau
+    )
+
+    bounds = (-1.0, 1.0) if allow_short else (0.0, 1.0)
+    bl_weights_arr = optimize_max_sharpe(combined_returns, cov_matrix, risk_free_rate, bounds)
+    bl_ret, bl_vol = portfolio_performance(bl_weights_arr, combined_returns, cov_matrix)
+
+    latest_prices = prices.iloc[-1]
+    dollar_values = df["Shares"] * latest_prices
+    current_weights_arr = (dollar_values / dollar_values.sum()).reindex(tickers).values
+    current_ret, current_vol = portfolio_performance(current_weights_arr, combined_returns, cov_matrix)
+
+    return {
+        "tickers": tickers,
+        "prior_returns": prior_returns.to_dict(),
+        "combined_returns": combined_returns.to_dict(),
+        "bl_weights": dict(zip(tickers, bl_weights_arr)),
+        "bl_return": bl_ret,
+        "bl_vol": bl_vol,
+        "current_weights": dict(zip(tickers, current_weights_arr)),
+        "current_return_under_bl_view": current_ret,
+        "current_vol_under_bl_view": current_vol,
+        "delta": delta,
+        "market_weights": market_weights.reindex(tickers).to_dict(),
+        "market_cap_source": market_cap_source
+    }
+
+
+# ================================
+# MARKET REGIME DETECTION (Gaussian Mixture Model)
+# Classifies NIFTY 50's history into distinct volatility/return regimes
+# using unsupervised learning (no labels are pre-assigned — the model finds
+# the clusters itself from daily return + rolling volatility features).
+# Regimes are then labelled post-hoc by sorting on mean return so results
+# are consistently interpretable ("Stressed/Bear" = lowest-return cluster).
+# ================================
+def detect_market_regimes(period="2y", n_regimes=3, rolling_vol_window=21):
+    from sklearn.mixture import GaussianMixture
+    from sklearn.preprocessing import StandardScaler
+
+    bench = get_benchmark_history("^NSEI", period=period)
+    bench_returns = bench.pct_change().dropna()
+    rolling_vol = bench_returns.rolling(rolling_vol_window).std()
+
+    features_df = pd.DataFrame({"return": bench_returns, "vol": rolling_vol}).dropna()
+    if len(features_df) < n_regimes * 15:
+        return None
+
+    X = features_df.values
+    X_scaled = StandardScaler().fit_transform(X)
+
+    gmm = GaussianMixture(n_components=n_regimes, random_state=42, n_init=5)
+    raw_labels = gmm.fit_predict(X_scaled)
+    features_df["regime_raw"] = raw_labels
+
+    cluster_stats = features_df.groupby("regime_raw").agg({"return": "mean", "vol": "mean"})
+    cluster_stats_sorted = cluster_stats.sort_values("return")
+
+    if n_regimes == 2:
+        names = ["Stressed / Bear", "Calm / Bull"]
+    elif n_regimes == 3:
+        names = ["Stressed / Bear", "Neutral / Transitional", "Calm / Bull"]
+    else:
+        names = [f"Regime {i + 1} (by ascending return)" for i in range(n_regimes)]
+
+    label_map = {idx: names[rank] for rank, idx in enumerate(cluster_stats_sorted.index)}
+    features_df["Regime"] = features_df["regime_raw"].map(label_map)
+
+    regime_summary = features_df.groupby("Regime").agg(
+        Days=("return", "count"),
+        Avg_Daily_Return=("return", "mean"),
+        Avg_Volatility=("vol", "mean")
+    )
+
+    return {
+        "regime_series": features_df["Regime"],
+        "regime_summary": regime_summary,
+        "n_regimes": n_regimes
+    }
+
+
+def get_portfolio_returns_for_period(period="2y"):
+    df = load_portfolio()
+    prices = get_historical_prices(df, period=period)
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if not tickers:
+        return None
+
+    df = df.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna()
+    if prices.empty or len(prices) < 2:
+        return None
+
+    returns = prices.pct_change().dropna()
+    latest_prices = prices.iloc[-1]
+    dollar_values = df["Shares"] * latest_prices
+    weights = dollar_values / dollar_values.sum()
+
+    return (returns[tickers] * weights[tickers]).sum(axis=1)
+
+
+def get_regime_conditional_metrics(period="2y", n_regimes=3, rolling_vol_window=21):
+    regime_result = detect_market_regimes(period=period, n_regimes=n_regimes, rolling_vol_window=rolling_vol_window)
+    if regime_result is None:
+        return None
+
+    portfolio_returns = get_portfolio_returns_for_period(period=period)
+    if portfolio_returns is None:
+        return None
+
+    bench = get_benchmark_history("^NSEI", period=period)
+    bench_returns = bench.pct_change().dropna()
+
+    regime_series = regime_result["regime_series"]
+    aligned = pd.concat([
+        portfolio_returns.rename("p"), bench_returns.rename("b"), regime_series.rename("Regime")
+    ], axis=1).dropna()
+
+    if aligned.empty:
+        return None
+
+    rows = []
+    for regime_name, group in aligned.groupby("Regime"):
+        if len(group) < 5:
+            continue
+        p_ret, b_ret = group["p"], group["b"]
+        rows.append({
+            "Regime": regime_name,
+            "Days Observed": int(len(group)),
+            "Portfolio Ann. Return": float(p_ret.mean() * 252),
+            "Portfolio Ann. Volatility": float(p_ret.std() * np.sqrt(252)),
+            "Beta vs NIFTY": float(p_ret.cov(b_ret) / (b_ret.var() + 1e-9)),
+            "Correlation vs NIFTY": float(p_ret.corr(b_ret))
+        })
+
+    if not rows:
+        return None
+
+    return {
+        "regime_conditional_metrics": pd.DataFrame(rows).set_index("Regime"),
+        "regime_series": regime_series,
+        "regime_summary": regime_result["regime_summary"],
+        "aligned_benchmark_returns": aligned["b"]
+    }
+
+
+# ================================
+# RISK PARITY (EQUAL RISK CONTRIBUTION) PORTFOLIO
+# Instead of maximizing Sharpe or minimizing volatility, solves for the
+# weight vector where EVERY holding contributes equally to total portfolio
+# risk (the methodology Bridgewater built its reputation on). Complements
+# Max Sharpe and Min Volatility as a third portfolio-construction philosophy.
+# ================================
+def _risk_parity_objective(weights, Sigma):
+    port_vol = np.sqrt(weights @ Sigma @ weights)
+    marginal = (Sigma @ weights) / (port_vol + 1e-12)
+    contributions = weights * marginal
+    target = port_vol / len(weights)
+    return float(np.sum((contributions - target) ** 2))
+
+
+def optimize_risk_parity(cov_matrix):
+    Sigma = cov_matrix.values if hasattr(cov_matrix, "values") else np.asarray(cov_matrix)
+    n = Sigma.shape[0]
+
+    constraints = ({"type": "eq", "fun": lambda w: np.sum(w) - 1},)
+    bounds_list = tuple((1e-4, 1.0) for _ in range(n))
+    init_guess = np.array(n * [1.0 / n])
+
+    result = minimize(
+        _risk_parity_objective, init_guess, args=(Sigma,),
+        method="SLSQP", bounds=bounds_list, constraints=constraints,
+        options={"ftol": 1e-14, "maxiter": 2000}
+    )
+    return result.x if result.success else init_guess
+
+
+def get_risk_parity_portfolio(include_tickers=None, period="1y"):
+    df = load_portfolio()
+    if include_tickers:
+        df = df[df["Ticker"].isin(include_tickers)]
+        if len(df) < 2:
+            return None
+
+    prices = get_historical_prices(df, period=period)
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if len(tickers) < 2:
+        return None
+
+    df = df.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna()
+    if prices.empty or len(prices) < 30:
+        return None
+
+    returns = prices.pct_change().dropna()
+    cov_matrix = returns.cov() * 252
+    mean_returns = returns.mean() * 252
+
+    rp_weights_arr = optimize_risk_parity(cov_matrix)
+    Sigma = cov_matrix.values
+    port_vol = float(np.sqrt(rp_weights_arr @ Sigma @ rp_weights_arr))
+    marginal = (Sigma @ rp_weights_arr) / (port_vol + 1e-12)
+    component = rp_weights_arr * marginal
+    pct_risk_contribution = component / (port_vol + 1e-12)
+
+    rp_ret, rp_vol = portfolio_performance(rp_weights_arr, mean_returns, cov_matrix)
+
+    latest_prices = prices.iloc[-1]
+    dollar_values = df["Shares"] * latest_prices
+    current_weights_arr = (dollar_values / dollar_values.sum()).values
+
+    return {
+        "tickers": tickers,
+        "risk_parity_weights": dict(zip(tickers, rp_weights_arr)),
+        "risk_parity_return": rp_ret,
+        "risk_parity_vol": rp_vol,
+        "pct_risk_contribution": dict(zip(tickers, pct_risk_contribution)),
+        "current_weights": dict(zip(tickers, current_weights_arr))
+    }
+
+
+# ================================
+# TARGET RETURN SOLVER
+# "I want X% annual return — what weights get me there with the LEAST risk?"
+# Reuses the same optimize_min_volatility(target_return=...) machinery
+# already used internally to sweep the efficient frontier — no new
+# optimization logic, just exposed as a standalone, user-facing query.
+# ================================
+def solve_target_return_portfolio(target_return, include_tickers=None, period="1y", allow_short=False):
+    df = load_portfolio()
+    if include_tickers:
+        df = df[df["Ticker"].isin(include_tickers)]
+        if len(df) < 2:
+            return None
+
+    prices = get_historical_prices(df, period=period)
+    if prices.empty:
+        return None
+
+    tickers = [t for t in df["Ticker"].tolist() if t in prices.columns]
+    if len(tickers) < 2:
+        return None
+
+    df = df.set_index("Ticker").loc[tickers]
+    prices = prices[tickers].ffill().dropna()
+    if prices.empty or len(prices) < 30:
+        return None
+
+    returns = prices.pct_change().dropna()
+    mean_returns = returns.mean() * 252
+    cov_matrix = returns.cov() * 252
+
+    min_ret, max_ret = float(mean_returns.min()), float(mean_returns.max())
+    feasible = min_ret <= target_return <= max_ret
+    clamped_target = min(max(target_return, min_ret), max_ret)
+
+    bounds = (-1.0, 1.0) if allow_short else (0.0, 1.0)
+    weights_arr = optimize_min_volatility(mean_returns, cov_matrix, target_return=clamped_target, bounds=bounds)
+    achieved_ret, achieved_vol = portfolio_performance(weights_arr, mean_returns, cov_matrix)
+
+    latest_prices = prices.iloc[-1]
+    dollar_values = df["Shares"] * latest_prices
+    current_weights_arr = (dollar_values / dollar_values.sum()).reindex(tickers).values
+    current_ret, current_vol = portfolio_performance(current_weights_arr, mean_returns, cov_matrix)
+
+    return {
+        "tickers": tickers,
+        "target_return": target_return,
+        "feasible": feasible,
+        "clamped_target": clamped_target,
+        "achieved_return": achieved_ret,
+        "achieved_vol": achieved_vol,
+        "weights": dict(zip(tickers, weights_arr)),
+        "current_weights": dict(zip(tickers, current_weights_arr)),
+        "current_return": current_ret,
+        "current_vol": current_vol,
+        "min_achievable_return": min_ret,
+        "max_achievable_return": max_ret
+    }

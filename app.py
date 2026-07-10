@@ -3,9 +3,11 @@ import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
+import plotly.io as pio
 import yfinance as yf
 import time
 import datetime
+from streamlit_autorefresh import st_autorefresh
 
 from portfolio import (
     load_portfolio,
@@ -33,6 +35,11 @@ from portfolio import (
     simulate_add_holding,
     build_excel_report,
     build_pdf_report,
+    run_black_litterman,
+    detect_market_regimes,
+    get_regime_conditional_metrics,
+    get_risk_parity_portfolio,
+    solve_target_return_portfolio,
     BENCHMARK_OPTIONS
 )
 
@@ -44,19 +51,71 @@ from llm import ask_llm
 # ================================
 st.set_page_config(page_title="Portfolio Intelligence", layout="wide", page_icon="📊")
 
-# Light styling polish — subtle card backgrounds behind metrics, tighter spacing,
-# consistent accent color matching the chart palette used throughout (#00C897).
-st.markdown("""
+# ================================
+# GLOBAL COLOR PALETTE & PLOTLY THEME
+# One consistent template applied to every chart in the app. Traces that set
+# their own explicit color (most existing charts) are unaffected — this only
+# unifies fonts, backgrounds, gridlines, and the default color sequence for
+# any chart that doesn't specify colors itself.
+# ================================
+PALETTE = {
+    "primary": "#00C897",    # positive / success
+    "danger": "#FF6B6B",     # negative / risk
+    "purple": "#6C63FF",     # optimizer / analytical
+    "warning": "#FFA500",    # caution / neutral-negative
+    "neutral": "#AAAAAA",
+    "grid": "rgba(255,255,255,0.08)"
+}
+
+_theme = go.layout.Template()
+_theme.layout.font = dict(family="Inter, -apple-system, Segoe UI, Helvetica, Arial, sans-serif", color="#E4E6EB", size=13)
+_theme.layout.paper_bgcolor = "rgba(0,0,0,0)"
+_theme.layout.plot_bgcolor = "rgba(0,0,0,0)"
+_theme.layout.colorway = [PALETTE["primary"], PALETTE["danger"], PALETTE["purple"], PALETTE["warning"], "#4ECDC4", "#F7B801", "#B892FF"]
+_theme.layout.xaxis = dict(gridcolor=PALETTE["grid"], zerolinecolor=PALETTE["grid"], linecolor=PALETTE["grid"])
+_theme.layout.yaxis = dict(gridcolor=PALETTE["grid"], zerolinecolor=PALETTE["grid"], linecolor=PALETTE["grid"])
+_theme.layout.legend = dict(bgcolor="rgba(0,0,0,0)")
+_theme.layout.hoverlabel = dict(bgcolor="#1F2430", font_size=12, font_family="Inter, sans-serif")
+_theme.layout.margin = dict(t=60, b=40, l=50, r=30)
+
+pio.templates["portfolio_theme"] = _theme
+pio.templates.default = "portfolio_theme"
+
+# ================================
+# CSS POLISH
+# ================================
+st.markdown(f"""
     <style>
-    div[data-testid="stMetric"] {
-        background-color: rgba(255, 255, 255, 0.03);
-        border: 1px solid rgba(255, 255, 255, 0.08);
-        border-radius: 10px;
-        padding: 14px 16px 10px 16px;
-    }
-    div[data-testid="stMetricLabel"] { font-size: 0.85rem; opacity: 0.85; }
-    h1 { padding-bottom: 0rem; }
-    .block-container { padding-top: 2rem; }
+    div[data-testid="stMetric"] {{
+        background: linear-gradient(135deg, rgba(0,200,151,0.08), rgba(108,99,255,0.05));
+        border: 1px solid rgba(255,255,255,0.10);
+        border-radius: 12px;
+        padding: 16px 18px 12px 18px;
+        transition: border-color 0.2s ease;
+    }}
+    div[data-testid="stMetric"]:hover {{ border-color: rgba(0,200,151,0.45); }}
+    div[data-testid="stMetricLabel"] {{ font-size: 0.82rem; opacity: 0.85; font-weight: 500; }}
+    div[data-testid="stMetricValue"] {{ font-size: 1.55rem; font-weight: 700; }}
+
+    h1 {{ padding-bottom: 0rem; letter-spacing: -0.02em; }}
+    h2, h3 {{ letter-spacing: -0.01em; }}
+    .block-container {{ padding-top: 1.8rem; }}
+
+    button[data-baseweb="tab"] {{ font-weight: 600; font-size: 0.95rem; }}
+    button[data-baseweb="tab"][aria-selected="true"] {{ color: {PALETTE["primary"]} !important; }}
+    div[data-baseweb="tab-highlight"] {{ background-color: {PALETTE["primary"]} !important; }}
+
+    .stButton > button {{
+        border-radius: 8px;
+        border: 1px solid rgba(0,200,151,0.35);
+        font-weight: 600;
+        transition: all 0.15s ease;
+    }}
+    .stButton > button:hover {{ border-color: {PALETTE["primary"]}; color: {PALETTE["primary"]}; }}
+
+    section[data-testid="stSidebar"] {{ border-right: 1px solid rgba(255,255,255,0.06); }}
+    div[data-testid="stDataFrame"] {{ border-radius: 8px; overflow: hidden; }}
+    details {{ border-radius: 8px; border: 1px solid rgba(255,255,255,0.08) !important; }}
     </style>
 """, unsafe_allow_html=True)
 
@@ -65,13 +124,64 @@ st.caption("Live NSE portfolio analytics — risk, backtesting, optimization, an
 
 
 # ================================
-# SIDEBAR CONTROLS
+# SIDEBAR CONTROLS — including auto-refresh
 # ================================
 st.sidebar.header("Controls")
-force_refresh = st.sidebar.button("🔄 Refresh Live Prices")
+
+force_refresh = st.sidebar.button("🔄 Refresh Now")
+if force_refresh:
+    st.cache_data.clear()
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("⏱️ Auto-Refresh")
+auto_refresh_on = st.sidebar.toggle("Enable auto-refresh", value=False)
+refresh_interval_label = st.sidebar.selectbox(
+    "Refresh every", ["30 seconds", "1 minute", "5 minutes", "15 minutes"], index=1,
+    disabled=not auto_refresh_on
+)
+_interval_map = {"30 seconds": 30, "1 minute": 60, "5 minutes": 300, "15 minutes": 900}
+refresh_interval_seconds = _interval_map[refresh_interval_label]
+
+if auto_refresh_on:
+    st_autorefresh(interval=refresh_interval_seconds * 1000, key="dashboard_autorefresh")
+    st.sidebar.caption(
+        f"Auto-refreshing every {refresh_interval_label}. "
+        f"Data is cached for up to 60s, so very short intervals won't over-call Yahoo Finance."
+    )
+
 st.sidebar.markdown("---")
 st.sidebar.caption("Prices: Last available close (NSE). Updates reflect latest trading session.")
 st.sidebar.caption(f"Last loaded: {datetime.datetime.now().strftime('%d %b %Y, %I:%M %p')}")
+
+
+# ================================
+# CACHED DATA-FETCH WRAPPERS
+# TTL=60s caps how often the underlying (network-calling) functions in
+# portfolio.py actually run, regardless of how often Streamlit reruns the
+# script — whether from auto-refresh, a widget interaction, or anything else.
+# "Refresh Now" above calls st.cache_data.clear() to bypass this immediately.
+# ================================
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_current_prices(_df):
+    return get_current_prices(_df)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_metrics():
+    return get_metrics()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_portfolio_history():
+    return get_portfolio_history()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _cached_benchmark_download():
+    b = yf.download("^NSEI", period="1y", auto_adjust=True, progress=False)["Close"]
+    if isinstance(b, pd.DataFrame):
+        b = b.iloc[:, 0]
+    return b
 
 
 # ================================
@@ -80,7 +190,7 @@ st.sidebar.caption(f"Last loaded: {datetime.datetime.now().strftime('%d %b %Y, %
 df = load_portfolio()
 
 with st.spinner("Fetching live prices..."):
-    prices = get_current_prices(df)
+    prices = _cached_current_prices(df)
 
 sector_map = get_sector_map()
 
@@ -101,16 +211,16 @@ if missing:
 # METRICS (computed once, used across tabs)
 # ================================
 with st.spinner("Computing portfolio metrics..."):
-    metrics = get_metrics()
+    metrics = _cached_metrics()
     capture = get_capture_ratios(
         portfolio_returns=metrics["returns"],
         benchmark_returns=metrics["benchmark_returns"]
     )
 
 with st.spinner("Loading historical data..."):
-    portfolio = get_portfolio_history()
+    portfolio = _cached_portfolio_history()
 
-benchmark = yf.download("^NSEI", period="1y", auto_adjust=True, progress=False)["Close"]
+benchmark = _cached_benchmark_download()
 if isinstance(benchmark, pd.DataFrame):
     benchmark = benchmark.iloc[:, 0]
 
@@ -698,10 +808,74 @@ with tab_advrisk:
               and low cross-holding correlation (see the Correlation Matrix in the Overview tab).
             """)
 
+    st.divider()
 
-# ============================================================
-# TAB 4 — BACKTESTING
-# ============================================================
+    # --- Market Regime Detection ---
+    st.subheader("🌐 Market Regime Detection")
+    st.caption("Classifies NIFTY 50's history into distinct volatility/return regimes using unsupervised learning (Gaussian Mixture Model), then shows how your portfolio behaves conditional on each regime.")
+
+    regime_col1, regime_col2 = st.columns(2)
+    with regime_col1:
+        regime_period = st.selectbox("Lookback Window", ["1y", "2y", "5y"], index=1, key="regime_period")
+    with regime_col2:
+        n_regimes = st.selectbox("Number of Regimes", [2, 3], index=1, key="n_regimes",
+                                  help="2 = Bear/Bull. 3 = Bear/Neutral/Bull.")
+
+    if st.button("Detect Regimes & Analyze Portfolio"):
+        with st.spinner("Fitting regime model and computing conditional metrics..."):
+            regime_cond_result = get_regime_conditional_metrics(
+                period=regime_period, n_regimes=n_regimes
+            )
+
+        if regime_cond_result is None:
+            st.error("Not enough historical data to fit a regime model for this window.")
+        else:
+            regime_series = regime_cond_result["regime_series"]
+            regime_summary = regime_cond_result["regime_summary"]
+            regime_metrics_df = regime_cond_result["regime_conditional_metrics"]
+
+            regime_color_map = {
+                "Stressed / Bear": PALETTE["danger"],
+                "Neutral / Transitional": PALETTE["warning"],
+                "Calm / Bull": PALETTE["primary"]
+            }
+
+            bench_cum = (1 + regime_cond_result["aligned_benchmark_returns"]).cumprod()
+            fig_regime = go.Figure()
+            for regime_name in regime_series.unique():
+                mask = regime_series.reindex(bench_cum.index) == regime_name
+                fig_regime.add_trace(go.Scatter(
+                    x=bench_cum.index[mask], y=bench_cum.values[mask],
+                    mode="markers", name=regime_name, marker=dict(
+                        size=4, color=regime_color_map.get(regime_name, PALETTE["neutral"])
+                    )
+                ))
+            fig_regime.update_layout(
+                title="NIFTY 50 Growth of ₹1, Colored by Detected Regime",
+                xaxis_title="Date", yaxis_title="Growth of ₹1"
+            )
+            st.plotly_chart(fig_regime, use_container_width=True)
+
+            st.markdown("#### Regime-Conditional Portfolio Metrics")
+            display_regime = regime_metrics_df.copy()
+            display_regime["Portfolio Ann. Return"] = display_regime["Portfolio Ann. Return"].map(lambda x: f"{x:.2%}")
+            display_regime["Portfolio Ann. Volatility"] = display_regime["Portfolio Ann. Volatility"].map(lambda x: f"{x:.2%}")
+            display_regime["Beta vs NIFTY"] = display_regime["Beta vs NIFTY"].map(lambda x: f"{x:.2f}")
+            display_regime["Correlation vs NIFTY"] = display_regime["Correlation vs NIFTY"].map(lambda x: f"{x:.2f}")
+            st.dataframe(display_regime, use_container_width=True)
+
+            with st.expander("ℹ️ How to read this"):
+                st.markdown("""
+                - Regimes are discovered **unsupervised** from NIFTY 50's own daily return and rolling
+                  volatility — no labels are assumed in advance; the model finds the clusters itself.
+                - The genuinely useful insight here is usually **volatility and correlation rising together
+                  in the Stressed regime** — a common real pattern where the diversification you counted on
+                  in calm markets partially disappears exactly when you need it most.
+                - This is a statistical clustering, not a forecast — it describes historical regimes, not
+                  which regime comes next.
+                """)
+
+
 # ============================================================
 # TAB 4 — WHAT-IF & ATTRIBUTION
 # ============================================================
@@ -830,6 +1004,88 @@ with tab_whatif:
                       above ~0.7 suggests the new holding largely duplicates risk you already have.
                     - This uses trailing historical data only — it says nothing about the new holding's
                       valuation, fundamentals, or forward-looking prospects.
+                    """)
+
+    st.divider()
+
+    # --- Target Return Solver ---
+    st.subheader("🎯 Target Return Solver")
+    st.caption("\"I want X% annual return — what weights get me there with the least risk?\" Reuses the same optimizer engine as the Efficient Frontier.")
+
+    tr_col1, tr_col2, tr_col3 = st.columns(3)
+    with tr_col1:
+        target_return_pct = st.slider("Target Annual Return (%)", -20.0, 60.0, 15.0, step=0.5)
+    with tr_col2:
+        tr_tickers = st.multiselect("Assets to Use", all_tickers, default=all_tickers, key="tr_tickers")
+    with tr_col3:
+        tr_period = st.selectbox("Historical Window", ["6mo", "1y", "2y", "5y"], index=1, key="tr_period")
+
+    tr_allow_short = st.checkbox("Allow short-selling (negative weights)", value=False, key="tr_short")
+
+    if st.button("Solve for Target Return"):
+        if len(tr_tickers) < 2:
+            st.error("Select at least 2 assets.")
+        else:
+            with st.spinner("Solving for the minimum-risk portfolio at this target return..."):
+                tr_result = solve_target_return_portfolio(
+                    target_return=target_return_pct / 100.0,
+                    include_tickers=tr_tickers, period=tr_period, allow_short=tr_allow_short
+                )
+
+            if tr_result is None:
+                st.error("Not enough overlapping historical data for the selected assets.")
+            else:
+                if not tr_result["feasible"]:
+                    st.warning(
+                        f"⚠️ {target_return_pct:.1f}% isn't achievable with these assets over this window. "
+                        f"Achievable range is {tr_result['min_achievable_return']:.1%} to "
+                        f"{tr_result['max_achievable_return']:.1%} annually. Showing the closest feasible portfolio "
+                        f"(clamped to {tr_result['clamped_target']:.1%})."
+                    )
+
+                trcol1, trcol2 = st.columns(2)
+                trcol1.metric("Achieved Return", f"{tr_result['achieved_return']:.2%}")
+                trcol2.metric("Required Volatility", f"{tr_result['achieved_vol']:.2%}")
+
+                weight_compare_rows = []
+                for t in tr_result["tickers"]:
+                    weight_compare_rows.append({
+                        "Ticker": t,
+                        "Current Weight": tr_result["current_weights"][t],
+                        "Target-Return Weight": tr_result["weights"][t]
+                    })
+                weight_compare_df = pd.DataFrame(weight_compare_rows).set_index("Ticker")
+                weight_compare_display = weight_compare_df.apply(lambda col: col.map(lambda x: f"{x:.2%}"))
+                st.dataframe(weight_compare_display, use_container_width=True)
+
+                subset_df_tr = df[df["Ticker"].isin(tr_result["tickers"])].set_index("Ticker")
+                subset_value_tr = subset_df_tr["Value"].sum()
+                trade_rows_tr = []
+                for t in tr_result["tickers"]:
+                    if t not in subset_df_tr.index or pd.isna(subset_df_tr.loc[t, "CurrentPrice"]):
+                        continue
+                    price = subset_df_tr.loc[t, "CurrentPrice"]
+                    current_shares = subset_df_tr.loc[t, "Shares"]
+                    target_value = tr_result["weights"][t] * subset_value_tr
+                    target_shares = target_value / price
+                    delta_shares = target_shares - current_shares
+                    trade_rows_tr.append({
+                        "Ticker": t,
+                        "Action": "Buy" if delta_shares > 0.05 else ("Sell" if delta_shares < -0.05 else "Hold"),
+                        "Shares to Trade": round(abs(delta_shares), 1),
+                        "Approx ₹ Value": f"₹{abs(delta_shares * price):,.0f}"
+                    })
+                if trade_rows_tr:
+                    st.markdown("#### Suggested Trades to Reach This Target")
+                    st.dataframe(pd.DataFrame(trade_rows_tr).set_index("Ticker"), use_container_width=True)
+
+                with st.expander("ℹ️ How this works"):
+                    st.markdown("""
+                    - Solves the same minimum-volatility-for-a-given-return problem used to sweep the
+                      Efficient Frontier in the Optimizer tab — just exposed here as a direct "what weights
+                      hit my target" query instead of scanning the whole frontier.
+                    - If your target is outside what these assets can achieve, it's clamped to the nearest
+                      feasible point and clearly flagged, rather than silently returning a meaningless answer.
                     """)
 
 
@@ -986,6 +1242,7 @@ with tab_optimizer:
                     risk_free_rate=opt_rf_rate,
                     allow_short=allow_short
                 )
+                rp_result = get_risk_parity_portfolio(include_tickers=opt_tickers, period=opt_period)
 
             if opt_result is None:
                 st.error("Not enough overlapping historical data for the selected assets to run the optimizer.")
@@ -1025,6 +1282,13 @@ with tab_optimizer:
                     marker=dict(size=14, color="#FFA500", symbol="square")
                 ))
 
+                if rp_result is not None:
+                    fig_frontier.add_trace(go.Scatter(
+                        x=[rp_result["risk_parity_vol"] * 100], y=[rp_result["risk_parity_return"] * 100],
+                        mode="markers", name="Risk Parity Portfolio",
+                        marker=dict(size=14, color="#4ECDC4", symbol="triangle-up")
+                    ))
+
                 fig_frontier.update_layout(
                     title="Efficient Frontier — Risk vs Return",
                     xaxis_title="Annualised Volatility (%)", yaxis_title="Annualised Return (%)",
@@ -1034,25 +1298,33 @@ with tab_optimizer:
 
                 weight_rows = []
                 for t in opt_result["tickers"]:
-                    weight_rows.append({
+                    row = {
                         "Ticker": t,
                         "Current Weight": opt_result["current_weights"][t],
                         "Max Sharpe Weight": opt_result["max_sharpe_weights"][t],
                         "Min Volatility Weight": opt_result["min_vol_weights"][t]
-                    })
+                    }
+                    if rp_result is not None and t in rp_result["risk_parity_weights"]:
+                        row["Risk Parity Weight"] = rp_result["risk_parity_weights"][t]
+                    weight_rows.append(row)
                 weight_df = pd.DataFrame(weight_rows).set_index("Ticker")
                 weight_df_display = weight_df.apply(lambda col: col.map(lambda x: f"{x:.2%}"))
                 st.dataframe(weight_df_display, use_container_width=True)
 
                 st.markdown("#### 💡 Suggested Rebalancing Trades")
+                target_options = ["Max Sharpe Portfolio", "Min Volatility Portfolio"]
+                if rp_result is not None:
+                    target_options.append("Risk Parity Portfolio")
                 target_choice = st.radio(
-                    "Target Allocation", ["Max Sharpe Portfolio", "Min Volatility Portfolio"],
+                    "Target Allocation", target_options,
                     horizontal=True, key="opt_target_choice"
                 )
-                target_weights_map = (
-                    opt_result["max_sharpe_weights"] if target_choice == "Max Sharpe Portfolio"
-                    else opt_result["min_vol_weights"]
-                )
+                if target_choice == "Max Sharpe Portfolio":
+                    target_weights_map = opt_result["max_sharpe_weights"]
+                elif target_choice == "Min Volatility Portfolio":
+                    target_weights_map = opt_result["min_vol_weights"]
+                else:
+                    target_weights_map = rp_result["risk_parity_weights"]
 
                 subset_df = df[df["Ticker"].isin(opt_result["tickers"])].set_index("Ticker")
                 subset_value = subset_df["Value"].sum()
@@ -1084,13 +1356,16 @@ with tab_optimizer:
                         "broker's tradable lot size. This ignores brokerage, taxes, and market impact."
                     )
 
-                summary_col1, summary_col2, summary_col3 = st.columns(3)
+                summary_col1, summary_col2, summary_col3, summary_col4 = st.columns(4)
                 summary_col1.metric("Current Portfolio", f"{opt_result['current_return']:.2%} return",
                                      f"{opt_result['current_vol']:.2%} volatility")
                 summary_col2.metric("Max Sharpe Portfolio", f"{opt_result['max_sharpe_return']:.2%} return",
                                      f"{opt_result['max_sharpe_vol']:.2%} volatility")
                 summary_col3.metric("Min Volatility Portfolio", f"{opt_result['min_vol_return']:.2%} return",
                                      f"{opt_result['min_vol_vol']:.2%} volatility")
+                if rp_result is not None:
+                    summary_col4.metric("Risk Parity Portfolio", f"{rp_result['risk_parity_return']:.2%} return",
+                                         f"{rp_result['risk_parity_vol']:.2%} volatility")
 
                 with st.expander("ℹ️ How to read this"):
                     st.markdown("""
@@ -1100,13 +1375,119 @@ with tab_optimizer:
                       meaning the same or better return is achievable at lower risk with different weights.
                     - The **green star** is the max-Sharpe (best risk-adjusted return) portfolio; the **orange square**
                       is the lowest-volatility portfolio achievable from these assets.
+                    - The **teal triangle** is the Risk Parity portfolio — instead of maximizing return or minimizing
+                      volatility, it balances weights so every holding contributes *equally* to total portfolio risk
+                      (the methodology Bridgewater built its reputation on). It won't sit on the frontier curve itself,
+                      since "equal risk contribution" is a different objective than "maximum return per unit of risk."
                     - This is based purely on **trailing historical data** — it assumes the past return/risk/correlation
                       pattern continues, which is a real limitation of mean-variance optimization in practice.
                     """)
 
+    st.divider()
+
+    # --- Black-Litterman View-Based Optimization ---
+    st.subheader("🧠 Black-Litterman: View-Based Optimization")
+    st.caption("Starts from market-implied equilibrium returns, then blends in your own views — a more stable alternative to feeding raw historical returns straight into an optimizer.")
+
+    if "bl_views" not in st.session_state:
+        st.session_state.bl_views = []
+
+    st.markdown("#### Add a View")
+    bl_view_col1, bl_view_col2, bl_view_col3, bl_view_col4 = st.columns([2, 2, 2, 1])
+    with bl_view_col1:
+        bl_view_ticker = st.selectbox("Ticker", all_tickers, key="bl_view_ticker")
+    with bl_view_col2:
+        bl_view_return = st.number_input("I think it will return (annual %)", -50.0, 100.0, 15.0, step=1.0, key="bl_view_return")
+    with bl_view_col3:
+        bl_view_confidence = st.slider("My confidence", 0, 100, 50, key="bl_view_confidence", help="0% = ignore this view entirely, 100% = fully trust it over the market's implied view.")
+    with bl_view_col4:
+        st.write("")
+        st.write("")
+        if st.button("➕ Add"):
+            st.session_state.bl_views.append({
+                "ticker": bl_view_ticker,
+                "expected_return": bl_view_return / 100.0,
+                "confidence": max(bl_view_confidence / 100.0, 0.001)
+            })
+
+    if st.session_state.bl_views:
+        st.markdown("#### Your Views")
+        views_display = pd.DataFrame(st.session_state.bl_views)
+        views_display["expected_return"] = views_display["expected_return"].map(lambda x: f"{x:.1%}")
+        views_display["confidence"] = views_display["confidence"].map(lambda x: f"{x:.0%}")
+        views_display.columns = ["Ticker", "Expected Return", "Confidence"]
+        st.dataframe(views_display, use_container_width=True)
+        if st.button("🗑️ Clear All Views"):
+            st.session_state.bl_views = []
+            st.rerun()
+    else:
+        st.info("No views added yet — running without views will just show the market-implied equilibrium portfolio.")
+
+    bl_col1, bl_col2 = st.columns(2)
+    with bl_col1:
+        bl_use_market_cap = st.checkbox("Use live market capitalization for equilibrium weights", value=True,
+                                         help="If unavailable for any holding, falls back to your current portfolio weights as a proxy.")
+    with bl_col2:
+        bl_tau = st.slider("Tau (prior uncertainty)", 0.01, 0.10, 0.025, step=0.005,
+                            help="Lower = more trust in market equilibrium. Higher = more room for views to dominate.")
+
+    if st.button("Run Black-Litterman Optimization"):
+        if len(opt_tickers) < 2:
+            st.error("Select at least 2 assets in 'Assets to Optimize Over' above.")
+        else:
+            with st.spinner("Computing equilibrium returns and blending in your views..."):
+                bl_result = run_black_litterman(
+                    include_tickers=opt_tickers, period=opt_period,
+                    views=st.session_state.bl_views, tau=bl_tau,
+                    risk_free_rate=opt_rf_rate, use_market_cap=bl_use_market_cap,
+                    allow_short=allow_short
+                )
+
+            if bl_result is None:
+                st.error("Not enough overlapping historical data for the selected assets.")
+            else:
+                st.caption(f"Equilibrium weights source: **{bl_result['market_cap_source']}** · Implied risk aversion (δ): {bl_result['delta']:.2f}")
+
+                blcol1, blcol2 = st.columns(2)
+                blcol1.metric("Black-Litterman Portfolio", f"{bl_result['bl_return']:.2%} return",
+                               f"{bl_result['bl_vol']:.2%} volatility")
+                blcol2.metric("Current Portfolio (under BL views)", f"{bl_result['current_return_under_bl_view']:.2%} return",
+                               f"{bl_result['current_vol_under_bl_view']:.2%} volatility")
+
+                returns_compare_rows = []
+                for t in bl_result["tickers"]:
+                    returns_compare_rows.append({
+                        "Ticker": t,
+                        "Market-Implied (Prior) Return": bl_result["prior_returns"][t],
+                        "Combined (Posterior) Return": bl_result["combined_returns"][t],
+                        "Black-Litterman Weight": bl_result["bl_weights"][t],
+                        "Current Weight": bl_result["current_weights"][t]
+                    })
+                returns_compare_df = pd.DataFrame(returns_compare_rows).set_index("Ticker")
+                returns_compare_display = returns_compare_df.copy()
+                for col in ["Market-Implied (Prior) Return", "Combined (Posterior) Return",
+                            "Black-Litterman Weight", "Current Weight"]:
+                    returns_compare_display[col] = returns_compare_display[col].map(lambda x: f"{x:.2%}")
+                st.dataframe(returns_compare_display, use_container_width=True)
+
+                with st.expander("ℹ️ How to read this"):
+                    st.markdown("""
+                    - **Market-Implied (Prior) Return**: what expected returns would have to be for your
+                      equilibrium weights to already be optimal — derived mathematically from the covariance
+                      matrix and weights, not guessed.
+                    - **Combined (Posterior) Return**: the prior blended with your views, weighted by how
+                      confident you said you were in each one.
+                    - Tickers you gave no view on still shift slightly — this is intentional: because assets
+                      are correlated, a strong view on one holding has spillover effects on the expected
+                      returns of correlated holdings too.
+                    - **Tau** controls how much weight the *entire prior* gets relative to your views as a
+                      whole — separate from per-view confidence, which controls how much *each individual
+                      view* is trusted.
+                    """)
+
 
 # ============================================================
-# TAB 5 — SMART INSIGHTS (AI-POWERED)
+# TAB 7 — SMART INSIGHTS (AI-POWERED)
 # ============================================================
 with tab_ai:
     st.subheader("🤖 Smart Insights")
